@@ -11,7 +11,8 @@ import io.github.achrafaittayeb.dtp.common.model.TaskType;
 public final class TaskPayloads {
 
     public static final long MAX_SLEEP_MILLIS = 10 * 60 * 1000L; // 10 minutes
-    public static final int MAX_TEXT_CHARS = 512 * 1024;
+    /** Bounded so a worst-case UTF-8 encoding still fits comfortably in one 1 MiB frame. */
+    public static final int MAX_TEXT_CHARS = 200_000;
     public static final long MAX_PRIME_LIMIT = 50_000_000L;
 
     private TaskPayloads() {
