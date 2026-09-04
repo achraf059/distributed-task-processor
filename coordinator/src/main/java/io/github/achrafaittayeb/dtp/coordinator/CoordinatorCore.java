@@ -326,13 +326,23 @@ public final class CoordinatorCore implements AutoCloseable {
     }
 
     private void runOnCore(Runnable event) {
-        coreThread.execute(() -> {
-            try {
-                event.run();
-            } catch (RuntimeException unexpected) {
-                log.error("Core event failed", unexpected);
-            }
-        });
+        // Once shutdown begins, no further state transitions are applied: a
+        // graceful stop leaves the same durable state as a crash, so recovery
+        // has exactly one shutdown shape to reason about.
+        if (coreThread.isShutdown()) {
+            return;
+        }
+        try {
+            coreThread.execute(() -> {
+                try {
+                    event.run();
+                } catch (RuntimeException unexpected) {
+                    log.error("Core event failed", unexpected);
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException shuttingDown) {
+            log.debug("Event dropped during shutdown");
+        }
     }
 
     /** Runs a query on the core thread and waits for the answer. */

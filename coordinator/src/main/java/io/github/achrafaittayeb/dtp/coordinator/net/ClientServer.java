@@ -42,7 +42,9 @@ public final class ClientServer implements AutoCloseable {
     private volatile boolean closed;
 
     public ClientServer(int port, CoordinatorCore core) throws IOException {
-        this.serverSocket = new ServerSocket(port);
+        this.serverSocket = new ServerSocket();
+        this.serverSocket.setReuseAddress(true);
+        this.serverSocket.bind(new java.net.InetSocketAddress(port));
         this.core = core;
         this.acceptorThread = new Thread(this::acceptLoop, "client-acceptor");
     }
@@ -73,7 +75,9 @@ public final class ClientServer implements AutoCloseable {
     }
 
     private void handleConnection(Socket socket) {
-        try (socket) {
+        // Note: no try-with-resources on the socket — that would close it before
+        // the catch blocks run, making the error reply below unsendable.
+        try {
             InputStream in = socket.getInputStream();
             OutputStream out = socket.getOutputStream();
             Message request;
@@ -87,6 +91,11 @@ public final class ClientServer implements AutoCloseable {
         } catch (IOException disconnected) {
             log.debug("Client connection ended: {}", disconnected.getMessage());
         } finally {
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+                // already closed
+            }
             openSockets.remove(socket);
         }
     }

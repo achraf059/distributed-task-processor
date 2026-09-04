@@ -40,7 +40,11 @@ public final class WorkerServer implements AutoCloseable {
     private volatile boolean closed;
 
     public WorkerServer(int port, CoordinatorCore core) throws IOException {
-        this.serverSocket = new ServerSocket(port);
+        // SO_REUSEADDR so a restarted coordinator can rebind its port while old
+        // connections linger in TIME_WAIT.
+        this.serverSocket = new ServerSocket();
+        this.serverSocket.setReuseAddress(true);
+        this.serverSocket.bind(new java.net.InetSocketAddress(port));
         this.core = core;
         this.acceptorThread = new Thread(this::acceptLoop, "worker-acceptor");
     }

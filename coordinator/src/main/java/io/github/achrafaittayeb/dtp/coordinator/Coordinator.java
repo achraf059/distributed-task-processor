@@ -57,9 +57,12 @@ public final class Coordinator implements AutoCloseable {
 
     @Override
     public void close() {
+        // Stop the brain first: after this, disconnect events from closing
+        // sockets are ignored and durable job state is frozen as-is, so a
+        // graceful stop is indistinguishable from a crash at recovery time.
+        core.close();
         clientServer.close();
         workerServer.close();
-        core.close();
         log.info("Coordinator stopped");
     }
 }
