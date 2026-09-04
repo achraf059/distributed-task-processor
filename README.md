@@ -6,10 +6,12 @@ protocol, detects worker failures through heartbeats, retries and reassigns
 lost work under **at-least-once** semantics protected by **attempt leases**,
 and recovers its state from **SQLite** after a restart.
 
-Everything interesting — the wire protocol, framing, scheduling, failure
-detection, retry/lease logic, persistence, and recovery — is implemented in
-this repository. There is no Kafka, no RabbitMQ, no workflow engine, and no
-RPC framework; that is the point of the project.
+The core distributed-systems mechanisms — including protocol framing,
+scheduling, failure detection, retry/lease handling, persistence, and
+recovery — are implemented directly in this repository rather than delegated
+to messaging or workflow frameworks. There is no Kafka, no RabbitMQ, no
+workflow engine, and no RPC framework; understanding these mechanisms is the
+purpose of the project.
 
 ## Why this exists
 
@@ -88,7 +90,8 @@ were declared dead and later resurface are logged and rejected. See
 ## Requirements
 
 - JDK 21+ (build is `--release 21`)
-- Nothing else — the Maven Wrapper downloads Maven itself.
+- Nothing else — the Maven Wrapper downloads Maven itself (network access is
+  required for the first build).
 
 ## Build and test
 
@@ -184,14 +187,19 @@ it, and watch the job finish.
 
 ## Docker
 
+A multi-stage `Dockerfile` and a `docker-compose.yml` (one coordinator, three
+workers, job database on a named volume) are included:
+
 ```bash
 docker compose up --build
 ```
 
-runs one coordinator and three workers in separate containers, with the job
-database on a named volume. `docker compose kill worker-1` while a job runs on
-it shows the same reassignment story across containers. Local Java execution
-is the primary supported path; Compose is a convenience.
+**Note:** the Docker configuration has not yet been runtime-verified — the
+development machine does not have Docker installed. Local Java execution is
+the primary, fully verified path; treat Compose as unverified convenience
+until you have run it yourself. Once running, `docker compose kill worker-1`
+during a job is intended to reproduce the same reassignment story across
+containers.
 
 ## Testing
 
