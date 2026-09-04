@@ -20,6 +20,9 @@ public final class TaskPayloads {
 
     /** Validates {@code payload} for {@code type}; throws with a client-friendly message otherwise. */
     public static void validate(TaskType type, JsonNode payload) throws InvalidPayloadException {
+        if (type == null) {
+            throw new InvalidPayloadException("Missing task type");
+        }
         if (payload == null || !payload.isObject()) {
             throw new InvalidPayloadException("Payload must be a JSON object");
         }

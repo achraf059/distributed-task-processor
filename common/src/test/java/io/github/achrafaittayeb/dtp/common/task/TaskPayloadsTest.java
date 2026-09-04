@@ -26,6 +26,13 @@ class TaskPayloadsTest {
     }
 
     @Test
+    void rejectsMissingTaskType() {
+        assertThatThrownBy(() -> TaskPayloads.validate(null, payload().put("text", "x")))
+                .isInstanceOf(InvalidPayloadException.class)
+                .hasMessageContaining("task type");
+    }
+
+    @Test
     void rejectsNonObjectPayload() {
         assertThatThrownBy(() -> TaskPayloads.validate(TaskType.SLEEP, null))
                 .isInstanceOf(InvalidPayloadException.class);

@@ -94,10 +94,6 @@ final class ScriptedWorker implements AutoCloseable {
         return assign;
     }
 
-    boolean hasPendingAssignment() {
-        return !assignments.isEmpty();
-    }
-
     /** Removes and returns all assignments received so far. */
     java.util.List<TaskAssign> drainAssignments() {
         java.util.List<TaskAssign> drained = new java.util.ArrayList<>();
