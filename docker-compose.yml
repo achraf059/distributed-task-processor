@@ -1,0 +1,45 @@
+# Coordinator + three workers in separate containers.
+#   docker compose up --build
+# Then from the host:
+#   ./scripts/client.sh submit sleep --milliseconds 30000
+#   docker compose kill worker-1        # watch the job get reassigned
+# Job state persists in the named volume across coordinator restarts.
+
+services:
+  coordinator:
+    build:
+      context: .
+      target: coordinator
+    ports:
+      - "7070:7070"   # worker protocol
+      - "7071:7071"   # client protocol
+    command: ["--database", "/data/coordinator.db"]
+    volumes:
+      - coordinator-data:/data
+
+  worker-1:
+    build:
+      context: .
+      target: worker
+    command: ["--coordinator-host", "coordinator", "--id", "worker-1"]
+    depends_on:
+      - coordinator
+
+  worker-2:
+    build:
+      context: .
+      target: worker
+    command: ["--coordinator-host", "coordinator", "--id", "worker-2"]
+    depends_on:
+      - coordinator
+
+  worker-3:
+    build:
+      context: .
+      target: worker
+    command: ["--coordinator-host", "coordinator", "--id", "worker-3"]
+    depends_on:
+      - coordinator
+
+volumes:
+  coordinator-data:

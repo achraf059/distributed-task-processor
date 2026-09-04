@@ -84,7 +84,7 @@ public final class WorkerServer implements AutoCloseable {
                 return; // peer closed or spoke garbage before registering
             }
             readLoop(session, in);
-            core.onWorkerDisconnected(session, "connection closed by worker");
+            core.onWorkerDisconnected(session, "connection closed");
         } catch (ProtocolException badPeer) {
             log.warn("Protocol violation from {}: {}", socket.getRemoteSocketAddress(), badPeer.getMessage());
             if (session != null) {
