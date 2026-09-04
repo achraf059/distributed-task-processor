@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>io.github.achrafaittayeb.dtp</groupId>
+    <artifactId>distributed-task-processor</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>dtp-integration-tests</artifactId>
+  <name>DTP :: Integration Tests</name>
+  <description>
+    End-to-end tests running Coordinator and Workers in-process on ephemeral ports:
+    execution, multi-worker concurrency, worker failure, retries, stale results,
+    coordinator restart recovery, and protocol robustness.
+  </description>
+
+  <dependencies>
+    <dependency>
+      <groupId>io.github.achrafaittayeb.dtp</groupId>
+      <artifactId>dtp-coordinator</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.github.achrafaittayeb.dtp</groupId>
+      <artifactId>dtp-worker</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.github.achrafaittayeb.dtp</groupId>
+      <artifactId>dtp-client</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-failsafe-plugin</artifactId>
+        <executions>
+          <execution>
+            <goals>
+              <goal>integration-test</goal>
+              <goal>verify</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

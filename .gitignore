@@ -1,0 +1,27 @@
+# Build output
+target/
+*.class
+
+# Maven wrapper downloads (only-script wrapper keeps nothing locally, but be safe)
+.mvn/wrapper/maven-wrapper.jar
+
+# Runtime data
+data/
+*.db
+*.db-journal
+logs/
+*.log
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+
+# OS
+.DS_Store
+
+# Local tooling
+.claude/
