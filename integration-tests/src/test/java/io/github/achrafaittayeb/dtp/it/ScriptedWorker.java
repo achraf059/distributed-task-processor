@@ -4,6 +4,7 @@ import io.github.achrafaittayeb.dtp.common.net.MessageIO;
 import io.github.achrafaittayeb.dtp.common.protocol.Heartbeat;
 import io.github.achrafaittayeb.dtp.common.protocol.Message;
 import io.github.achrafaittayeb.dtp.common.protocol.TaskAssign;
+import io.github.achrafaittayeb.dtp.common.protocol.TaskCancel;
 import io.github.achrafaittayeb.dtp.common.protocol.TaskResult;
 import io.github.achrafaittayeb.dtp.common.protocol.WorkerRegister;
 import io.github.achrafaittayeb.dtp.common.protocol.WorkerRegistered;
@@ -31,6 +32,7 @@ final class ScriptedWorker implements AutoCloseable {
     private final Socket socket;
     private final OutputStream out;
     private final BlockingQueue<TaskAssign> assignments = new LinkedBlockingQueue<>();
+    private final BlockingQueue<TaskCancel> cancels = new LinkedBlockingQueue<>();
     private final ScheduledExecutorService heartbeater =
             Executors.newSingleThreadScheduledExecutor();
     private final Thread readerThread;
@@ -66,6 +68,8 @@ final class ScriptedWorker implements AutoCloseable {
             while ((message = MessageIO.receive(in)) != null) {
                 if (message instanceof TaskAssign assign) {
                     assignments.add(assign);
+                } else if (message instanceof TaskCancel cancel) {
+                    cancels.add(cancel);
                 }
             }
         } catch (IOException endOfConnection) {
@@ -99,6 +103,15 @@ final class ScriptedWorker implements AutoCloseable {
         java.util.List<TaskAssign> drained = new java.util.ArrayList<>();
         assignments.drainTo(drained);
         return drained;
+    }
+
+    /** Blocks until a TASK_CANCEL arrives, or fails the test after the timeout. */
+    TaskCancel awaitCancel() throws InterruptedException {
+        TaskCancel cancel = cancels.poll(10, TimeUnit.SECONDS);
+        if (cancel == null) {
+            throw new AssertionError("Scripted worker " + workerId + " received no TASK_CANCEL");
+        }
+        return cancel;
     }
 
     /** Simulates a hung process: the TCP connection stays open but liveness stops. */

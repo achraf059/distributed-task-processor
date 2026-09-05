@@ -53,6 +53,19 @@ class MessageSerializationTest {
     }
 
     @Test
+    void roundTripsCancellationMessages() throws IOException {
+        assertThat(roundTrip(new TaskCancel("job-1", "att-1")))
+                .isEqualTo(new TaskCancel("job-1", "att-1"));
+        assertThat(roundTrip(new CancelJob("job-1")))
+                .isEqualTo(new CancelJob("job-1"));
+
+        JobSnapshot cancelled = new JobSnapshot("job-1", TaskType.SLEEP, JobState.CANCELLED,
+                1, 3, null, null, "cancelled by client request", 100L, 200L);
+        assertThat(roundTrip(new JobCancelReply(true, cancelled)))
+                .isEqualTo(new JobCancelReply(true, cancelled));
+    }
+
+    @Test
     void encodedMessagesCarryTypeDiscriminator() throws IOException {
         String json = new String(MessageIO.encode(new Heartbeat("w")), StandardCharsets.UTF_8);
         assertThat(json).contains("\"type\":\"HEARTBEAT\"");
