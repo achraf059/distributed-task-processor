@@ -5,6 +5,7 @@ import io.github.achrafaittayeb.dtp.common.net.ProtocolException;
 import io.github.achrafaittayeb.dtp.common.protocol.Heartbeat;
 import io.github.achrafaittayeb.dtp.common.protocol.Message;
 import io.github.achrafaittayeb.dtp.common.protocol.TaskAssign;
+import io.github.achrafaittayeb.dtp.common.protocol.TaskCancel;
 import io.github.achrafaittayeb.dtp.common.protocol.TaskResult;
 import io.github.achrafaittayeb.dtp.common.protocol.WorkerRegister;
 import io.github.achrafaittayeb.dtp.common.protocol.WorkerRegistered;
@@ -18,8 +19,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -51,7 +50,7 @@ public final class Worker implements AutoCloseable {
     private final ExecutorService taskPool;
     private final ScheduledExecutorService heartbeatScheduler;
     private final Thread connectionThread;
-    private final Map<String, Future<?>> inFlightTasks = new ConcurrentHashMap<>();
+    private final InFlightTasks inFlightTasks = new InFlightTasks();
     private volatile boolean running = true;
     private volatile Socket currentSocket;
 
@@ -131,10 +130,11 @@ public final class Worker implements AutoCloseable {
     private void assignmentLoop(InputStream in, OutputStream out) throws IOException {
         Message message;
         while ((message = MessageIO.receive(in)) != null) {
-            if (message instanceof TaskAssign assign) {
-                executeAsync(assign, out);
-            } else {
-                log.warn("Ignoring unexpected message: {}", message.getClass().getSimpleName());
+            switch (message) {
+                case TaskAssign assign -> executeAsync(assign, out);
+                case TaskCancel cancel -> cancelTask(cancel);
+                default -> log.warn("Ignoring unexpected message: {}",
+                        message.getClass().getSimpleName());
             }
         }
         log.info("Coordinator closed the connection");
@@ -145,7 +145,9 @@ public final class Worker implements AutoCloseable {
                 assign.jobId(), assign.taskType(), assign.attemptNumber());
         Future<?> future = taskPool.submit(() -> {
             TaskResult result = execute(assign);
-            inFlightTasks.remove(assign.jobId());
+            // Remove only if this attempt is still the tracked one; a cancel or a
+            // newer assignment for the same job must not be clobbered.
+            inFlightTasks.remove(assign.jobId(), assign.attemptId());
             try {
                 sendLocked(out, result);
                 log.info("Task result sent: jobId={} success={}", assign.jobId(), result.success());
@@ -154,7 +156,25 @@ public final class Worker implements AutoCloseable {
                 log.warn("Could not report result for jobId={}; connection is gone", assign.jobId());
             }
         });
-        inFlightTasks.put(assign.jobId(), future);
+        inFlightTasks.put(assign.jobId(), assign.attemptId(), future);
+    }
+
+    /**
+     * Cooperatively cancels a running attempt. Only cancels if both jobId and
+     * attemptId match the tracked assignment, so a cancel for a superseded
+     * attempt cannot interrupt a newer one. Interruption is best-effort: tasks
+     * that don't respond keep running, but their lease is already revoked at the
+     * coordinator, so any result they produce is stale-rejected.
+     */
+    private void cancelTask(TaskCancel cancel) {
+        boolean cancelled = inFlightTasks.cancelIfMatches(cancel.jobId(), cancel.attemptId());
+        if (cancelled) {
+            log.info("Cancelled task on request: jobId={} attemptId={}",
+                    cancel.jobId(), cancel.attemptId());
+        } else {
+            log.debug("Ignoring TASK_CANCEL for untracked attempt: jobId={} attemptId={}",
+                    cancel.jobId(), cancel.attemptId());
+        }
     }
 
     private TaskResult execute(TaskAssign assign) {
@@ -184,8 +204,7 @@ public final class Worker implements AutoCloseable {
     }
 
     private void cancelInFlightTasks() {
-        inFlightTasks.values().forEach(task -> task.cancel(true));
-        inFlightTasks.clear();
+        inFlightTasks.cancelAll();
     }
 
     /** Graceful stop: close the connection, interrupt tasks, shut down pools. */

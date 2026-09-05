@@ -2,8 +2,10 @@ package io.github.achrafaittayeb.dtp.coordinator.net;
 
 import io.github.achrafaittayeb.dtp.common.net.MessageIO;
 import io.github.achrafaittayeb.dtp.common.net.ProtocolException;
+import io.github.achrafaittayeb.dtp.common.protocol.CancelJob;
 import io.github.achrafaittayeb.dtp.common.protocol.ErrorReply;
 import io.github.achrafaittayeb.dtp.common.protocol.GetJobStatus;
+import io.github.achrafaittayeb.dtp.common.protocol.JobCancelReply;
 import io.github.achrafaittayeb.dtp.common.protocol.JobListReply;
 import io.github.achrafaittayeb.dtp.common.protocol.JobStatusReply;
 import io.github.achrafaittayeb.dtp.common.protocol.JobSubmitted;
@@ -110,6 +112,12 @@ public final class ClientServer implements AutoCloseable {
                         .orElseGet(() -> new ErrorReply("Unknown job: " + status.jobId()));
                 case ListJobs ignored -> new JobListReply(core.listJobs());
                 case ListWorkers ignored -> new WorkerListReply(core.listWorkers());
+                case CancelJob cancel -> {
+                    CoordinatorCore.CancelOutcome outcome = core.cancelJob(cancel.jobId());
+                    yield outcome.found()
+                            ? new JobCancelReply(outcome.cancelledNow(), outcome.job())
+                            : new ErrorReply("Unknown job: " + cancel.jobId());
+                }
                 default -> new ErrorReply("Unsupported request: "
                         + request.getClass().getSimpleName());
             };

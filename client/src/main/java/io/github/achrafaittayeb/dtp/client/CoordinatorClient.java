@@ -6,8 +6,10 @@ import io.github.achrafaittayeb.dtp.common.model.TaskType;
 import io.github.achrafaittayeb.dtp.common.model.WorkerSnapshot;
 import io.github.achrafaittayeb.dtp.common.net.MessageIO;
 import io.github.achrafaittayeb.dtp.common.net.ProtocolException;
+import io.github.achrafaittayeb.dtp.common.protocol.CancelJob;
 import io.github.achrafaittayeb.dtp.common.protocol.ErrorReply;
 import io.github.achrafaittayeb.dtp.common.protocol.GetJobStatus;
+import io.github.achrafaittayeb.dtp.common.protocol.JobCancelReply;
 import io.github.achrafaittayeb.dtp.common.protocol.JobListReply;
 import io.github.achrafaittayeb.dtp.common.protocol.JobStatusReply;
 import io.github.achrafaittayeb.dtp.common.protocol.JobSubmitted;
@@ -72,6 +74,21 @@ public final class CoordinatorClient implements AutoCloseable {
         Message reply = exchange(new ListWorkers());
         if (reply instanceof WorkerListReply list) {
             return list.workers();
+        }
+        throw asError(reply);
+    }
+
+    /**
+     * Requests cancellation of a job. Returns the job's snapshot; check its
+     * state to see the outcome (CANCELLED if this call cancelled it, or the
+     * job's actual terminal state if it had already finished).
+     *
+     * @throws IOException if the job id is unknown
+     */
+    public synchronized JobCancelReply cancel(String jobId) throws IOException {
+        Message reply = exchange(new CancelJob(jobId));
+        if (reply instanceof JobCancelReply cancelReply) {
+            return cancelReply;
         }
         throw asError(reply);
     }

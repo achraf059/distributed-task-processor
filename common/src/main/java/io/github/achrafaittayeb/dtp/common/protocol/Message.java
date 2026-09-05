@@ -22,23 +22,26 @@ import com.fasterxml.jackson.annotation.JsonTypeInfo;
         // Coordinator -> Worker
         @JsonSubTypes.Type(value = WorkerRegistered.class, name = "WORKER_REGISTERED"),
         @JsonSubTypes.Type(value = TaskAssign.class, name = "TASK_ASSIGN"),
+        @JsonSubTypes.Type(value = TaskCancel.class, name = "TASK_CANCEL"),
         // Client -> Coordinator
         @JsonSubTypes.Type(value = SubmitJob.class, name = "SUBMIT_JOB"),
         @JsonSubTypes.Type(value = GetJobStatus.class, name = "GET_JOB_STATUS"),
         @JsonSubTypes.Type(value = ListJobs.class, name = "LIST_JOBS"),
         @JsonSubTypes.Type(value = ListWorkers.class, name = "LIST_WORKERS"),
+        @JsonSubTypes.Type(value = CancelJob.class, name = "CANCEL_JOB"),
         // Coordinator -> Client
         @JsonSubTypes.Type(value = JobSubmitted.class, name = "JOB_SUBMITTED"),
         @JsonSubTypes.Type(value = JobStatusReply.class, name = "JOB_STATUS"),
         @JsonSubTypes.Type(value = JobListReply.class, name = "JOB_LIST"),
         @JsonSubTypes.Type(value = WorkerListReply.class, name = "WORKER_LIST"),
+        @JsonSubTypes.Type(value = JobCancelReply.class, name = "JOB_CANCEL"),
         // Either direction
         @JsonSubTypes.Type(value = ErrorReply.class, name = "ERROR"),
 })
 public sealed interface Message
         permits WorkerRegister, Heartbeat, TaskResult,
-        WorkerRegistered, TaskAssign,
-        SubmitJob, GetJobStatus, ListJobs, ListWorkers,
-        JobSubmitted, JobStatusReply, JobListReply, WorkerListReply,
+        WorkerRegistered, TaskAssign, TaskCancel,
+        SubmitJob, GetJobStatus, ListJobs, ListWorkers, CancelJob,
+        JobSubmitted, JobStatusReply, JobListReply, WorkerListReply, JobCancelReply,
         ErrorReply {
 }
