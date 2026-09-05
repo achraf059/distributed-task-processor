@@ -77,6 +77,7 @@ public final class ClientMain {
                 }
                 case "list" -> listJobs(client);
                 case "workers" -> listWorkers(client);
+                case "cancel" -> cancel(client, requireJobId(positionals));
                 default -> throw new UsageException("Unknown command: " + command);
             }
         }
@@ -152,6 +153,17 @@ public final class ClientMain {
         }
     }
 
+    private static void cancel(CoordinatorClient client, String jobId) throws Exception {
+        var reply = client.cancel(jobId);
+        if (reply.cancelled()) {
+            System.out.println("Job cancelled");
+        } else {
+            System.out.println("Job already finished; nothing to cancel (state "
+                    + reply.job().state() + ")");
+        }
+        printJob(reply.job());
+    }
+
     private static void listWorkers(CoordinatorClient client) throws Exception {
         List<WorkerSnapshot> workers = client.listWorkers();
         if (workers.isEmpty()) {
@@ -199,6 +211,7 @@ public final class ClientMain {
                   submit fail --fail-until-attempt <n>
                   status <job-id>
                   wait <job-id> [--timeout-millis <ms>]
+                  cancel <job-id>
                   list
                   workers
                 Global options: --host <host> (default localhost), --port <port> (default 7071)

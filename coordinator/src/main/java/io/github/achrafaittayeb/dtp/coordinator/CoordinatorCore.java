@@ -6,6 +6,7 @@ import io.github.achrafaittayeb.dtp.common.model.JobState;
 import io.github.achrafaittayeb.dtp.common.model.TaskType;
 import io.github.achrafaittayeb.dtp.common.model.WorkerSnapshot;
 import io.github.achrafaittayeb.dtp.common.protocol.TaskAssign;
+import io.github.achrafaittayeb.dtp.common.protocol.TaskCancel;
 import io.github.achrafaittayeb.dtp.common.protocol.TaskResult;
 import io.github.achrafaittayeb.dtp.common.task.InvalidPayloadException;
 import io.github.achrafaittayeb.dtp.common.task.TaskPayloads;
@@ -119,7 +120,8 @@ public final class CoordinatorCore implements AutoCloseable {
         TaskPayloads.validate(taskType, payload);
         int maxAttempts = requestedMaxAttempts > 0 ? requestedMaxAttempts : config.defaultMaxAttempts();
         return askCore(() -> {
-            Job job = Job.createQueued(taskType, payload, maxAttempts, now());
+            Job job = Job.createQueued(taskType, payload, maxAttempts,
+                    config.taskTimeoutMillis(), now());
             jobs.put(job.id(), job);
             repository.save(job);
             log.info("Job submitted: jobId={} type={} maxAttempts={}",
@@ -131,6 +133,34 @@ public final class CoordinatorCore implements AutoCloseable {
 
     public Optional<JobSnapshot> getJob(String jobId) {
         return askCore(() -> Optional.ofNullable(jobs.get(jobId)).map(Job::snapshot));
+    }
+
+    /** Outcome of a cancellation request: whether the job is present, and whether this call cancelled it. */
+    public record CancelOutcome(boolean found, boolean cancelledNow, JobSnapshot job) {
+    }
+
+    /**
+     * Cancels a job on client request. QUEUED / RETRY_WAIT / RUNNING → CANCELLED
+     * (a RUNNING attempt's lease is revoked and a best-effort TASK_CANCEL is
+     * sent); already-terminal jobs are left untouched and reported as such.
+     */
+    public CancelOutcome cancelJob(String jobId) {
+        return askCore(() -> {
+            Job job = jobs.get(jobId);
+            if (job == null) {
+                return new CancelOutcome(false, false, null);
+            }
+            if (job.state().isTerminal()) {
+                return new CancelOutcome(true, false, job.snapshot());
+            }
+            String attemptId = job.currentAttemptId();
+            String workerId = job.assignedWorkerId();
+            job.cancel(now());
+            repository.save(job);
+            revokeAttemptOnWorker(jobId, attemptId, workerId, "cancelled by client");
+            log.info("Job cancelled by client: jobId={} previousWorker={}", jobId, workerId);
+            return new CancelOutcome(true, true, job.snapshot());
+        });
     }
 
     public List<JobSnapshot> listJobs() {
@@ -148,10 +178,11 @@ public final class CoordinatorCore implements AutoCloseable {
     // Core-thread logic
     // ------------------------------------------------------------------
 
-    /** Periodic maintenance: failure detection, retry promotion, scheduling. */
+    /** Periodic maintenance: failure detection, deadline enforcement, retry promotion, scheduling. */
     private void sweep() {
         try {
             detectDeadWorkers();
+            detectExpiredDeadlines();
             promoteDueRetries();
             scheduleQueuedJobs();
         } catch (RuntimeException unexpected) {
@@ -191,6 +222,59 @@ public final class CoordinatorCore implements AutoCloseable {
             }
             retryOrFail(job, "worker " + session.workerId() + " lost (" + reason + ")");
         }
+    }
+
+    /**
+     * A worker being alive does not imply every task on it is making progress.
+     * Each RUNNING attempt carries a coordinator-clock deadline; once it
+     * expires the attempt's lease is revoked and the job retried, exactly as
+     * if the worker had been lost — except the worker stays registered and a
+     * best-effort {@code TASK_CANCEL} asks it to stop the wasted work. Expiry
+     * is suspicion that the task exceeded its execution contract, not proof of
+     * failure: if the task finishes anyway, its result fails the lease check.
+     */
+    private void detectExpiredDeadlines() {
+        long now = now();
+        for (Job job : jobs.values()) {
+            if (!job.isDeadlineExpired(now)) {
+                continue;
+            }
+            // Capture lease identity before retryOrFail clears it.
+            String attemptId = job.currentAttemptId();
+            String workerId = job.assignedWorkerId();
+            long overdueBy = now - job.deadlineMillis();
+            log.warn("Task execution deadline expired: jobId={} workerId={} attempt={}/{} "
+                            + "timeoutMillis={} overdueMillis={}",
+                    job.id(), workerId, job.attempts(), job.maxAttempts(),
+                    job.executionTimeoutMillis(), overdueBy);
+            revokeAttemptOnWorker(job.id(), attemptId, workerId, "deadline exceeded");
+            retryOrFail(job, "execution deadline exceeded ("
+                    + job.executionTimeoutMillis() + " ms) on worker " + workerId);
+        }
+    }
+
+    /**
+     * Best-effort request that {@code workerId} stop executing {@code attemptId},
+     * and release the worker's capacity slot for it. Safe to call even if the
+     * send fails: the caller revokes the lease anyway, so any result the task
+     * still produces is stale-rejected. Shared by deadline expiry and
+     * client-requested cancellation.
+     */
+    private void revokeAttemptOnWorker(String jobId, String attemptId, String workerId, String reason) {
+        if (workerId == null || attemptId == null) {
+            return;
+        }
+        registry.find(workerId).ifPresent(session -> {
+            session.removeActiveJob(jobId);
+            try {
+                session.send(new TaskCancel(jobId, attemptId));
+                log.info("Sent TASK_CANCEL: jobId={} workerId={} attemptId={} reason=\"{}\"",
+                        jobId, workerId, attemptId, reason);
+            } catch (IOException sendFailed) {
+                log.debug("TASK_CANCEL to {} failed (harmless, lease already revoked): {}",
+                        workerId, sendFailed.getMessage());
+            }
+        });
     }
 
     private void retryOrFail(Job job, String attemptError) {

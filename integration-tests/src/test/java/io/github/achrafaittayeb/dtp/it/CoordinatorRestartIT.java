@@ -107,6 +107,48 @@ class CoordinatorRestartIT {
     }
 
     @Test
+    void recoveryIgnoresStaleDeadlineAndRequeuesInsteadOfExpiring() throws Exception {
+        // A RUNNING job's deadline is a coordinator-clock instant from the old
+        // process. Recovery must NOT resurrect that assignment and let its
+        // deadline "expire" it — it requeues (lease discarded) like any other
+        // in-flight job, and the fresh assignment gets a fresh deadline.
+        String database = tempDir.resolve("stale-deadline.db").toString();
+        String jobId;
+
+        // Tiny task timeout: if recovery wrongly kept the old deadline, the job
+        // would already be "expired" the instant it loads.
+        Coordinator first = Testbed.startCoordinator(database, 3, 200);
+        ScriptedWorker worker = ScriptedWorker.register(first.workerPort(), "w1", 1);
+        try (CoordinatorClient client = Testbed.connectClient(first)) {
+            jobId = client.submit(TaskType.SLEEP,
+                    JsonNodeFactory.instance.objectNode().put("durationMillis", 50), 3);
+            worker.awaitAssignment();
+            assertThat(client.status(jobId).state()).isEqualTo(JobState.RUNNING);
+        } finally {
+            first.close();
+            worker.close();
+        }
+
+        // Let real time pass the old deadline before the new coordinator starts.
+        Thread.sleep(400);
+
+        try (Coordinator second = Testbed.startCoordinator(database, 3, 200);
+             CoordinatorClient client = Testbed.connectClient(second)) {
+            // Requeued by the recovery rule, not failed by a stale deadline.
+            JobSnapshot recovered = client.status(jobId);
+            assertThat(recovered.state()).isEqualTo(JobState.QUEUED);
+            assertThat(recovered.attempts()).isEqualTo(1);
+
+            try (Worker realWorker = Testbed.startWorker(second, "w2", 1)) {
+                JobSnapshot done = client.awaitTerminal(
+                        jobId, Testbed.POLL, Testbed.TERMINAL_TIMEOUT);
+                assertThat(done.state()).isEqualTo(JobState.COMPLETED);
+                assertThat(done.attempts()).isEqualTo(2);
+            }
+        }
+    }
+
+    @Test
     void workerAutomaticallyReconnectsToRestartedCoordinatorOnSamePorts() throws Exception {
         String database = tempDir.resolve("reconnect.db").toString();
 
@@ -131,7 +173,7 @@ class CoordinatorRestartIT {
                     new io.github.achrafaittayeb.dtp.coordinator.CoordinatorConfig(
                             workerPort, clientPort,
                             Testbed.HEARTBEAT_TIMEOUT_MILLIS, Testbed.SWEEP_INTERVAL_MILLIS,
-                            3, 50, 200, database))) {
+                            Testbed.TASK_TIMEOUT_MILLIS, 3, 50, 200, database))) {
                 second.start();
                 try (CoordinatorClient client = new CoordinatorClient("localhost", clientPort)) {
                     Testbed.waitUntil("worker re-registered after restart", Testbed.TERMINAL_TIMEOUT,

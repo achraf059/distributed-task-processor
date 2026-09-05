@@ -20,6 +20,8 @@ final class Testbed {
 
     static final long HEARTBEAT_TIMEOUT_MILLIS = 600;
     static final long SWEEP_INTERVAL_MILLIS = 50;
+    /** Generous default so execution deadlines never fire in tests that aren't about them. */
+    static final long TASK_TIMEOUT_MILLIS = 60_000;
     static final long WORKER_HEARTBEAT_MILLIS = 100;
     static final Duration POLL = Duration.ofMillis(50);
     static final Duration TERMINAL_TIMEOUT = Duration.ofSeconds(15);
@@ -29,9 +31,15 @@ final class Testbed {
 
     /** Coordinator on ephemeral ports; {@code database} may be {@code :memory:} or a temp file. */
     static Coordinator startCoordinator(String database, int maxAttempts) throws IOException {
+        return startCoordinator(database, maxAttempts, TASK_TIMEOUT_MILLIS);
+    }
+
+    static Coordinator startCoordinator(String database, int maxAttempts, long taskTimeoutMillis)
+            throws IOException {
         Coordinator coordinator = new Coordinator(new CoordinatorConfig(
                 0, 0,
                 HEARTBEAT_TIMEOUT_MILLIS, SWEEP_INTERVAL_MILLIS,
+                taskTimeoutMillis,
                 maxAttempts,
                 50, 200,
                 database));

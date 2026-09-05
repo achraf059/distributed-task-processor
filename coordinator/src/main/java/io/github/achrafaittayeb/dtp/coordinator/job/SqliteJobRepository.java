@@ -33,15 +33,17 @@ public final class SqliteJobRepository implements JobRepository {
     private static final Logger log = LoggerFactory.getLogger(SqliteJobRepository.class);
 
     private static final String UPSERT = """
-            INSERT INTO jobs (id, task_type, payload, max_attempts, state, attempts,
-                              current_attempt_id, assigned_worker_id, next_eligible_time,
-                              result, error, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO jobs (id, task_type, payload, max_attempts, execution_timeout,
+                              state, attempts, current_attempt_id, assigned_worker_id,
+                              deadline, next_eligible_time, result, error,
+                              created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 state = excluded.state,
                 attempts = excluded.attempts,
                 current_attempt_id = excluded.current_attempt_id,
                 assigned_worker_id = excluded.assigned_worker_id,
+                deadline = excluded.deadline,
                 next_eligible_time = excluded.next_eligible_time,
                 result = excluded.result,
                 error = excluded.error,
@@ -72,16 +74,37 @@ public final class SqliteJobRepository implements JobRepository {
                         task_type TEXT NOT NULL,
                         payload TEXT NOT NULL,
                         max_attempts INTEGER NOT NULL,
+                        execution_timeout INTEGER NOT NULL DEFAULT 600000,
                         state TEXT NOT NULL,
                         attempts INTEGER NOT NULL,
                         current_attempt_id TEXT,
                         assigned_worker_id TEXT,
+                        deadline INTEGER NOT NULL DEFAULT 0,
                         next_eligible_time INTEGER NOT NULL,
                         result TEXT,
                         error TEXT,
                         created_at INTEGER NOT NULL,
                         updated_at INTEGER NOT NULL
                     )""");
+        }
+        // Databases created before execution deadlines existed lack these two
+        // columns; add them in place so old job history remains loadable.
+        ensureColumn("execution_timeout", "INTEGER NOT NULL DEFAULT 600000");
+        ensureColumn("deadline", "INTEGER NOT NULL DEFAULT 0");
+    }
+
+    private void ensureColumn(String column, String definition) throws SQLException {
+        try (Statement statement = connection.createStatement();
+             ResultSet columns = statement.executeQuery("PRAGMA table_info(jobs)")) {
+            while (columns.next()) {
+                if (column.equals(columns.getString("name"))) {
+                    return;
+                }
+            }
+        }
+        try (Statement statement = connection.createStatement()) {
+            statement.execute("ALTER TABLE jobs ADD COLUMN " + column + " " + definition);
+            log.info("Migrated jobs table: added column {}", column);
         }
     }
 
@@ -92,15 +115,17 @@ public final class SqliteJobRepository implements JobRepository {
             statement.setString(2, job.taskType().name());
             statement.setString(3, MessageIO.mapper().writeValueAsString(job.payload()));
             statement.setInt(4, job.maxAttempts());
-            statement.setString(5, job.state().name());
-            statement.setInt(6, job.attempts());
-            statement.setString(7, job.currentAttemptId());
-            statement.setString(8, job.assignedWorkerId());
-            statement.setLong(9, job.nextEligibleTimeMillis());
-            statement.setString(10, job.result());
-            statement.setString(11, job.error());
-            statement.setLong(12, job.createdAtMillis());
-            statement.setLong(13, job.updatedAtMillis());
+            statement.setLong(5, job.executionTimeoutMillis());
+            statement.setString(6, job.state().name());
+            statement.setInt(7, job.attempts());
+            statement.setString(8, job.currentAttemptId());
+            statement.setString(9, job.assignedWorkerId());
+            statement.setLong(10, job.deadlineMillis());
+            statement.setLong(11, job.nextEligibleTimeMillis());
+            statement.setString(12, job.result());
+            statement.setString(13, job.error());
+            statement.setLong(14, job.createdAtMillis());
+            statement.setLong(15, job.updatedAtMillis());
             statement.executeUpdate();
         } catch (SQLException | JsonProcessingException e) {
             // Losing durability silently would break recovery guarantees; fail loudly.
@@ -129,10 +154,12 @@ public final class SqliteJobRepository implements JobRepository {
                 TaskType.valueOf(row.getString("task_type")),
                 payload,
                 row.getInt("max_attempts"),
+                row.getLong("execution_timeout"),
                 JobState.valueOf(row.getString("state")),
                 row.getInt("attempts"),
                 row.getString("current_attempt_id"),
                 row.getString("assigned_worker_id"),
+                row.getLong("deadline"),
                 row.getLong("next_eligible_time"),
                 row.getString("result"),
                 row.getString("error"),

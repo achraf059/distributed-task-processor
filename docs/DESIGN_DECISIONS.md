@@ -116,3 +116,47 @@ backoff, and attempt budgets are all flags with documented defaults.
 Integration tests shrink them (100 ms heartbeats, 600 ms timeout) so the full
 failure suite runs in seconds without fake clocks — the same code paths run in
 tests and in the live demo, just faster.
+
+## 13. Time-bounded attempt leases (execution deadlines + cooperative cancellation)
+
+The attempt lease started as an identity (a UUID that fences stale results).
+It is now also a *time-bounded contract*: each assignment carries a deadline,
+and an expired lease is revoked exactly like a lost worker. This is the
+canonical distributed-systems lease (Gray & Cheriton) — the identity and the
+expiry are two faces of one primitive — so it deepened the system's strongest
+existing idea rather than adding a separate subsystem.
+
+Why it was needed: heartbeat detection is worker-granular. A worker can be
+perfectly alive and heartbeating while one task wedges, holding a capacity slot
+forever. Nothing else in the system could observe that. The deadline is the
+per-task progress signal heartbeats can't provide.
+
+Deliberate choices and their trade-offs:
+
+- **Coordinator clock only.** Expiry is judged against `System.currentTimeMillis`
+  on the coordinator; worker clocks are never read or compared. This avoids a
+  clock-synchronization dependency entirely, at the cost of the deadline
+  measuring wall-clock-since-assignment (including transit and queueing), not
+  pure on-worker execution time. For a timeout whose job is to catch "stuck",
+  that over-approximation is the safe direction.
+- **Reuse, not new machinery.** Deadline expiry funnels into the existing
+  `retryOrFail`, and a revoked lease is stale-rejected by the existing result
+  check. The only genuinely new code is a sweep predicate, a `TASK_CANCEL`
+  message, and worker-side interruption. No new rejection path, no new retry
+  path — fewer states to reason about.
+- **Cooperative cancellation, not preemption.** `TASK_CANCEL` interrupts the
+  task's thread; a task that ignores interruption keeps running. Hard
+  preemption (`Thread.stop`) is unsafe and was rejected. Correctness never
+  depends on the worker obeying — the lease is revoked coordinator-side first,
+  so an uncooperative task can only produce a stale, rejected result. This is
+  why the cancel can be honestly documented as best-effort without weakening
+  any guarantee.
+- **Recovery discards deadlines.** A persisted deadline is a dead process's
+  clock reading; recovery requeues RUNNING jobs and lets the fresh assignment
+  set a fresh deadline, so a stale deadline can never instant-expire a
+  recovered job.
+
+What this explicitly does **not** buy: it is not exactly-once (a timed-out task
+that actually finished still causes a retry — the at-least-once window is
+unchanged), and it is not a real-time guarantee (detection latency is bounded
+only by the sweep interval).
