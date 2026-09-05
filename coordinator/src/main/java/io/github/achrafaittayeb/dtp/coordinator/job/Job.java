@@ -21,35 +21,41 @@ public final class Job {
     private final TaskType taskType;
     private final JsonNode payload;
     private final int maxAttempts;
+    private final long executionTimeoutMillis;
     private final long createdAtMillis;
 
     private JobState state;
     private int attempts;
     private String currentAttemptId;
     private String assignedWorkerId;
+    private long deadlineMillis;
     private long nextEligibleTimeMillis;
     private String result;
     private String error;
     private long updatedAtMillis;
 
-    public static Job createQueued(TaskType taskType, JsonNode payload, int maxAttempts, long now) {
+    public static Job createQueued(TaskType taskType, JsonNode payload, int maxAttempts,
+                                   long executionTimeoutMillis, long now) {
         return new Job(UUID.randomUUID().toString(), taskType, payload, maxAttempts,
-                JobState.QUEUED, 0, null, null, 0, null, null, now, now);
+                executionTimeoutMillis, JobState.QUEUED, 0, null, null, 0, 0, null, null, now, now);
     }
 
     /** Full-field constructor used when rehydrating from persistent storage. */
     public Job(String id, TaskType taskType, JsonNode payload, int maxAttempts,
-               JobState state, int attempts, String currentAttemptId, String assignedWorkerId,
-               long nextEligibleTimeMillis, String result, String error,
+               long executionTimeoutMillis, JobState state, int attempts,
+               String currentAttemptId, String assignedWorkerId,
+               long deadlineMillis, long nextEligibleTimeMillis, String result, String error,
                long createdAtMillis, long updatedAtMillis) {
         this.id = id;
         this.taskType = taskType;
         this.payload = payload;
         this.maxAttempts = maxAttempts;
+        this.executionTimeoutMillis = executionTimeoutMillis;
         this.state = state;
         this.attempts = attempts;
         this.currentAttemptId = currentAttemptId;
         this.assignedWorkerId = assignedWorkerId;
+        this.deadlineMillis = deadlineMillis;
         this.nextEligibleTimeMillis = nextEligibleTimeMillis;
         this.result = result;
         this.error = error;
@@ -59,13 +65,16 @@ public final class Job {
 
     /**
      * QUEUED → RUNNING. Consumes one attempt and issues a fresh attempt lease;
-     * only a result carrying this lease id will ever be accepted.
+     * only a result carrying this lease id will ever be accepted. The lease is
+     * time-bounded: it expires at {@code now + executionTimeoutMillis}, measured
+     * exclusively on the coordinator's clock.
      */
     public String assignTo(String workerId, long now) {
         transition(JobState.RUNNING, now);
         attempts++;
         currentAttemptId = UUID.randomUUID().toString();
         assignedWorkerId = workerId;
+        deadlineMillis = now + executionTimeoutMillis;
         return currentAttemptId;
     }
 
@@ -107,8 +116,29 @@ public final class Job {
         clearLease();
     }
 
+    /**
+     * QUEUED / RETRY_WAIT / RUNNING → CANCELLED. Client-requested termination;
+     * any active attempt lease is discarded, so a late result from a worker
+     * that keeps computing fails the lease check and is rejected.
+     */
+    public void cancel(long now) {
+        transition(JobState.CANCELLED, now);
+        error = "cancelled by client request";
+        nextEligibleTimeMillis = 0;
+        clearLease();
+    }
+
     public boolean hasAttemptsLeft() {
         return attempts < maxAttempts;
+    }
+
+    /**
+     * True when this job's current attempt has outlived its execution deadline.
+     * Expiry is suspicion that the task is stuck, not proof the worker died —
+     * the worker may be healthy and heartbeating while one task wedges.
+     */
+    public boolean isDeadlineExpired(long now) {
+        return state == JobState.RUNNING && now > deadlineMillis;
     }
 
     /** True when a reported result belongs to this job's currently leased attempt. */
@@ -135,6 +165,7 @@ public final class Job {
     private void clearLease() {
         currentAttemptId = null;
         assignedWorkerId = null;
+        deadlineMillis = 0;
     }
 
     public JobSnapshot snapshot() {
@@ -156,6 +187,15 @@ public final class Job {
 
     public int maxAttempts() {
         return maxAttempts;
+    }
+
+    public long executionTimeoutMillis() {
+        return executionTimeoutMillis;
+    }
+
+    /** Coordinator-clock instant at which the current attempt's lease expires; 0 when not RUNNING. */
+    public long deadlineMillis() {
+        return deadlineMillis;
     }
 
     public JobState state() {

@@ -2,6 +2,7 @@ package io.github.achrafaittayeb.dtp.common.model;
 
 import org.junit.jupiter.api.Test;
 
+import static io.github.achrafaittayeb.dtp.common.model.JobState.CANCELLED;
 import static io.github.achrafaittayeb.dtp.common.model.JobState.COMPLETED;
 import static io.github.achrafaittayeb.dtp.common.model.JobState.FAILED;
 import static io.github.achrafaittayeb.dtp.common.model.JobState.QUEUED;
@@ -22,12 +23,23 @@ class JobStateTest {
     }
 
     @Test
+    void cancellationIsAllowedFromEveryNonTerminalState() {
+        assertThat(QUEUED.canTransitionTo(CANCELLED)).isTrue();
+        assertThat(RETRY_WAIT.canTransitionTo(CANCELLED)).isTrue();
+        assertThat(RUNNING.canTransitionTo(CANCELLED)).isTrue();
+        assertThat(COMPLETED.canTransitionTo(CANCELLED)).isFalse();
+        assertThat(FAILED.canTransitionTo(CANCELLED)).isFalse();
+    }
+
+    @Test
     void rejectsIllegalTransitions() {
         assertThat(QUEUED.canTransitionTo(COMPLETED)).isFalse();
         assertThat(QUEUED.canTransitionTo(FAILED)).isFalse();
         assertThat(RETRY_WAIT.canTransitionTo(RUNNING)).isFalse();
         assertThat(COMPLETED.canTransitionTo(RUNNING)).isFalse();
         assertThat(FAILED.canTransitionTo(QUEUED)).isFalse();
+        assertThat(CANCELLED.canTransitionTo(QUEUED)).isFalse();
+        assertThat(CANCELLED.canTransitionTo(RUNNING)).isFalse();
     }
 
     @Test
@@ -35,9 +47,11 @@ class JobStateTest {
         for (JobState target : JobState.values()) {
             assertThat(COMPLETED.canTransitionTo(target)).isFalse();
             assertThat(FAILED.canTransitionTo(target)).isFalse();
+            assertThat(CANCELLED.canTransitionTo(target)).isFalse();
         }
         assertThat(COMPLETED.isTerminal()).isTrue();
         assertThat(FAILED.isTerminal()).isTrue();
+        assertThat(CANCELLED.isTerminal()).isTrue();
         assertThat(RUNNING.isTerminal()).isFalse();
     }
 }

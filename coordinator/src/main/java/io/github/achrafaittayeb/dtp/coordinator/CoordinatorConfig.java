@@ -16,6 +16,7 @@ public record CoordinatorConfig(
         int clientPort,
         long heartbeatTimeoutMillis,
         long sweepIntervalMillis,
+        long taskTimeoutMillis,
         int defaultMaxAttempts,
         long retryBaseDelayMillis,
         long retryMaxDelayMillis,
@@ -25,6 +26,10 @@ public record CoordinatorConfig(
     public static final int DEFAULT_CLIENT_PORT = 7071;
     public static final long DEFAULT_HEARTBEAT_TIMEOUT_MILLIS = 6_000;
     public static final long DEFAULT_SWEEP_INTERVAL_MILLIS = 500;
+    /** Default per-attempt execution deadline; matches the largest built-in task bound (10 min). */
+    public static final long DEFAULT_TASK_TIMEOUT_MILLIS = 10 * 60 * 1_000;
+    /** Upper bound for per-job execution-timeout overrides (24 h). */
+    public static final long MAX_TASK_TIMEOUT_MILLIS = 24 * 60 * 60 * 1_000;
     public static final int DEFAULT_MAX_ATTEMPTS = 3;
     public static final long DEFAULT_RETRY_BASE_DELAY_MILLIS = 1_000;
     public static final long DEFAULT_RETRY_MAX_DELAY_MILLIS = 30_000;
@@ -40,6 +45,7 @@ public record CoordinatorConfig(
                 parsed.getInt("client-port", DEFAULT_CLIENT_PORT),
                 parsed.getLong("heartbeat-timeout-millis", DEFAULT_HEARTBEAT_TIMEOUT_MILLIS),
                 parsed.getLong("sweep-interval-millis", DEFAULT_SWEEP_INTERVAL_MILLIS),
+                parsed.getLong("task-timeout-millis", DEFAULT_TASK_TIMEOUT_MILLIS),
                 parsed.getInt("max-attempts", DEFAULT_MAX_ATTEMPTS),
                 parsed.getLong("retry-base-delay-millis", DEFAULT_RETRY_BASE_DELAY_MILLIS),
                 parsed.getLong("retry-max-delay-millis", DEFAULT_RETRY_MAX_DELAY_MILLIS),
@@ -49,6 +55,10 @@ public record CoordinatorConfig(
     public CoordinatorConfig {
         if (heartbeatTimeoutMillis <= 0 || sweepIntervalMillis <= 0) {
             throw new IllegalArgumentException("Timing intervals must be positive");
+        }
+        if (taskTimeoutMillis <= 0 || taskTimeoutMillis > MAX_TASK_TIMEOUT_MILLIS) {
+            throw new IllegalArgumentException(
+                    "task-timeout-millis must be in 1.." + MAX_TASK_TIMEOUT_MILLIS);
         }
         if (defaultMaxAttempts < 1) {
             throw new IllegalArgumentException("max-attempts must be >= 1");

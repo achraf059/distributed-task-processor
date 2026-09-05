@@ -25,6 +25,7 @@ public final class CoordinatorMain {
                       --client-port <port>              default 7071
                       --heartbeat-timeout-millis <ms>   default 6000
                       --sweep-interval-millis <ms>      default 500
+                      --task-timeout-millis <ms>        default 600000 (per-attempt execution deadline)
                       --max-attempts <n>                default 3
                       --retry-base-delay-millis <ms>    default 1000
                       --retry-max-delay-millis <ms>     default 30000

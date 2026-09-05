@@ -13,7 +13,10 @@ import java.util.Set;
  *    │            │ └────────▶ FAILED        (retries exhausted, or non-retryable)
  *    ├────────────┘                          (coordinator recovery requeue)
  *    │
- *    └──── RETRY_WAIT ◀─────── RUNNING       (worker lost / task failed, retry pending)
+ *    └──── RETRY_WAIT ◀─────── RUNNING       (worker lost / task failed / deadline
+ *                                             expired, retry pending)
+ *
+ * QUEUED / RETRY_WAIT / RUNNING ──▶ CANCELLED   (client-requested)
  * </pre>
  */
 public enum JobState {
@@ -26,20 +29,23 @@ public enum JobState {
     /** Terminal: a worker reported a successful result that was accepted. */
     COMPLETED,
     /** Terminal: retries were exhausted or the job was rejected permanently. */
-    FAILED;
+    FAILED,
+    /** Terminal: cancelled on client request; any in-flight attempt lease was revoked. */
+    CANCELLED;
 
     private static final Map<JobState, Set<JobState>> LEGAL_TRANSITIONS = Map.of(
-            QUEUED, EnumSet.of(RUNNING),
-            RUNNING, EnumSet.of(COMPLETED, FAILED, RETRY_WAIT, QUEUED),
-            RETRY_WAIT, EnumSet.of(QUEUED),
+            QUEUED, EnumSet.of(RUNNING, CANCELLED),
+            RUNNING, EnumSet.of(COMPLETED, FAILED, RETRY_WAIT, QUEUED, CANCELLED),
+            RETRY_WAIT, EnumSet.of(QUEUED, CANCELLED),
             COMPLETED, EnumSet.noneOf(JobState.class),
-            FAILED, EnumSet.noneOf(JobState.class));
+            FAILED, EnumSet.noneOf(JobState.class),
+            CANCELLED, EnumSet.noneOf(JobState.class));
 
     public boolean canTransitionTo(JobState target) {
         return LEGAL_TRANSITIONS.get(this).contains(target);
     }
 
     public boolean isTerminal() {
-        return this == COMPLETED || this == FAILED;
+        return this == COMPLETED || this == FAILED || this == CANCELLED;
     }
 }

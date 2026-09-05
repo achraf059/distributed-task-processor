@@ -119,7 +119,8 @@ public final class CoordinatorCore implements AutoCloseable {
         TaskPayloads.validate(taskType, payload);
         int maxAttempts = requestedMaxAttempts > 0 ? requestedMaxAttempts : config.defaultMaxAttempts();
         return askCore(() -> {
-            Job job = Job.createQueued(taskType, payload, maxAttempts, now());
+            Job job = Job.createQueued(taskType, payload, maxAttempts,
+                    config.taskTimeoutMillis(), now());
             jobs.put(job.id(), job);
             repository.save(job);
             log.info("Job submitted: jobId={} type={} maxAttempts={}",

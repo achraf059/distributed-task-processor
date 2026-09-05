@@ -10,10 +10,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class JobTest {
 
+    private static final long TIMEOUT = 60_000L;
+
     private static Job newJob(int maxAttempts) {
         return Job.createQueued(TaskType.SLEEP,
                 JsonNodeFactory.instance.objectNode().put("durationMillis", 100),
-                maxAttempts, 1_000L);
+                maxAttempts, TIMEOUT, 1_000L);
     }
 
     @Test
@@ -81,6 +83,57 @@ class JobTest {
         job.requeueAfterRetryWait(3L);
         job.assignTo("w", 4L);
         assertThat(job.hasAttemptsLeft()).isFalse();
+    }
+
+    @Test
+    void assignmentSetsCoordinatorClockDeadline() {
+        Job job = newJob(3);
+        job.assignTo("worker-1", 2_000L);
+
+        assertThat(job.deadlineMillis()).isEqualTo(2_000L + TIMEOUT);
+        assertThat(job.isDeadlineExpired(2_000L + TIMEOUT)).isFalse();
+        assertThat(job.isDeadlineExpired(2_001L + TIMEOUT)).isTrue();
+
+        job.complete("done", 3_000L);
+        assertThat(job.deadlineMillis()).isZero(); // deadline dies with the lease
+        assertThat(job.isDeadlineExpired(Long.MAX_VALUE)).isFalse();
+    }
+
+    @Test
+    void cancellationRevokesLeaseFromAnyNonTerminalState() {
+        Job queued = newJob(3);
+        queued.cancel(2_000L);
+        assertThat(queued.state()).isEqualTo(JobState.CANCELLED);
+        assertThat(queued.error()).contains("cancelled");
+
+        Job running = newJob(3);
+        String lease = running.assignTo("worker-1", 2_000L);
+        running.cancel(3_000L);
+        assertThat(running.state()).isEqualTo(JobState.CANCELLED);
+        assertThat(running.isCurrentAttempt(lease)).isFalse();
+        assertThat(running.assignedWorkerId()).isNull();
+        assertThat(running.deadlineMillis()).isZero();
+
+        Job retryWait = newJob(3);
+        retryWait.assignTo("worker-1", 2_000L);
+        retryWait.scheduleRetry("boom", 9_000L, 2_500L);
+        retryWait.cancel(3_000L);
+        assertThat(retryWait.state()).isEqualTo(JobState.CANCELLED);
+        assertThat(retryWait.isEligibleToRun(Long.MAX_VALUE)).isFalse();
+    }
+
+    @Test
+    void terminalJobsCannotBeCancelled() {
+        Job completed = newJob(3);
+        completed.assignTo("w", 1L);
+        completed.complete("ok", 2L);
+        assertThatThrownBy(() -> completed.cancel(3L))
+                .isInstanceOf(IllegalStateException.class);
+
+        Job cancelled = newJob(3);
+        cancelled.cancel(1L);
+        assertThatThrownBy(() -> cancelled.cancel(2L))
+                .isInstanceOf(IllegalStateException.class);
     }
 
     @Test
