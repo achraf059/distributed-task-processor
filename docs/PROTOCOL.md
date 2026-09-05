@@ -36,12 +36,20 @@ protocol error that closes *that connection only*.
 | `WORKER_REGISTERED` | C→W | `workerId` | acknowledgement |
 | `HEARTBEAT` | W→C | `workerId` | every 2 s by default |
 | `TASK_ASSIGN` | C→W | `jobId`, `attemptId`, `attemptNumber`, `taskType`, `payload` | `attemptId` is the lease |
+| `TASK_CANCEL` | C→W | `jobId`, `attemptId` | cancel that specific attempt; ignored unless both ids match the running one |
 | `TASK_RESULT` | W→C | `workerId`, `jobId`, `attemptId`, `success`, `result`, `error` | must echo the lease |
 | `ERROR` | C→W | `message` | e.g. registering wrong; connection then closes |
 
 There is no explicit `TASK_ACCEPTED`: assignment rides a healthy TCP
 connection, the coordinator tracks capacity itself, and a send failure or
 connection loss invalidates the attempt anyway (see DESIGN_DECISIONS).
+
+`TASK_CANCEL` is sent when an attempt's lease is revoked — either its execution
+deadline expired or a client cancelled the job. It is best-effort and advisory:
+the coordinator has already revoked the lease, so whether or not the worker
+acts on it, any result the attempt later produces is stale-rejected. The worker
+cancels only if **both** `jobId` and `attemptId` match its currently executing
+assignment, so a cancel for a superseded attempt can never interrupt a newer one.
 
 ### Client port (default 7071)
 
@@ -54,12 +62,13 @@ connection.
 | `GET_JOB_STATUS` (`jobId`) | `JOB_STATUS` (job snapshot) | unknown id → `ERROR` |
 | `LIST_JOBS` | `JOB_LIST` (snapshots, newest first) | |
 | `LIST_WORKERS` | `WORKER_LIST` (live workers) | |
+| `CANCEL_JOB` (`jobId`) | `JOB_CANCEL` (`cancelled`, job snapshot) | `cancelled=true` if this call moved it to CANCELLED; `false` if already terminal (snapshot shows real state); unknown id → `ERROR` |
 | any invalid | `ERROR` (`message`) | malformed frames get a best-effort `ERROR`, then close |
 
-A job snapshot contains: `jobId`, `taskType`, `state`, `attempts`,
-`maxAttempts`, `workerId` (only while RUNNING), `result`, `error` (last
-attempt's error, kept for history even after later success), `createdAtMillis`,
-`updatedAtMillis`.
+A job snapshot contains: `jobId`, `taskType`, `state` (one of QUEUED, RUNNING,
+RETRY_WAIT, COMPLETED, FAILED, CANCELLED), `attempts`, `maxAttempts`,
+`workerId` (only while RUNNING), `result`, `error` (last attempt's error, kept
+for history even after later success), `createdAtMillis`, `updatedAtMillis`.
 
 ## Task payloads
 

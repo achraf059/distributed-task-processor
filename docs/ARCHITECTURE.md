@@ -27,7 +27,8 @@ and every `Job`. It runs on one dedicated thread (a single-thread
 - client connection handlers submit queries and block for the answer
   (`askCore`);
 - the periodic **sweep** (default every 500 ms) runs on the core thread
-  itself: detect dead workers → promote due retries → schedule queued jobs.
+  itself: detect dead workers → detect expired execution deadlines → promote
+  due retries → schedule queued jobs.
 
 **Invariant:** because scheduling, result handling, failure detection, and
 recovery are all serialized on one thread, no interleaving can assign one job
@@ -54,6 +55,12 @@ DESIGN_DECISIONS.
   session removed and closed, each of its RUNNING jobs retried or failed.
   A dropped connection triggers the same path immediately via the reader
   thread's disconnect event.
+- **Deadline enforcer** (`detectExpiredDeadlines`) — a RUNNING job past its
+  per-attempt deadline (`assignedAt + task-timeout-millis`, coordinator clock)
+  has its lease revoked, a best-effort `TASK_CANCEL` sent to the owning worker
+  (`revokeAttemptOnWorker`), and is retried or failed. This is the only
+  detector that catches a stuck task on a *live* worker; it shares the retry
+  and stale-result machinery with worker-loss handling.
 - **RetryPolicy** — delay = `base × 2^(attempts-1)`, capped (defaults 1 s
   base, 30 s cap). The attempt *budget* lives on the job (`maxAttempts`,
   default 3, settable per job).

@@ -33,6 +33,33 @@ and takes the same invalidation path. Two honest caveats:
   reports, its `attemptId` no longer matches and the result is logged
   (`Stale result rejected`) and dropped.
 
+## Stuck task on a healthy worker (execution deadline)
+
+A worker being alive does **not** mean every task on it is making progress: a
+task can wedge (an infinite loop, a stuck I/O call) while the worker keeps
+heartbeating normally. Heartbeat detection cannot catch this — the worker is
+not dead. Execution deadlines close the gap.
+
+Each attempt is leased with a deadline of `assignedAt + executionTimeout`
+(`--task-timeout-millis`, default 10 min), measured **only on the
+coordinator's clock** — worker clocks are never consulted, so no clock
+synchronization is required. When the sweep finds a RUNNING job past its
+deadline it:
+
+1. revokes the lease (so any later result is stale-rejected);
+2. sends a best-effort `TASK_CANCEL` to the owning worker and frees its slot;
+3. retries the job (backoff) or fails it if the attempt budget is spent.
+
+Honest caveats, mirroring heartbeat detection:
+
+- A deadline is a *contract*, and expiry is *suspicion* that the task exceeded
+  it — not proof the task is broken. Set the timeout above legitimate task
+  durations; too low means healthy long tasks get retried forever and end
+  FAILED with an "execution deadline exceeded" error.
+- Cancellation is cooperative (thread interruption). A task that ignores
+  interruption keeps consuming CPU until it finishes, but its lease is already
+  gone, so it cannot affect job state.
+
 ## The classic at-least-once window
 
 Worker finishes the task → dies before `TASK_RESULT` is read by the
@@ -54,7 +81,22 @@ fails to hold. Covered cases (all integration-tested):
 - result for an attempt superseded by a retry (zombie worker returns);
 - duplicate result for an attempt that already completed;
 - result for a job the coordinator no longer considers running;
-- result for an unknown job id.
+- result for an unknown job id;
+- result from an attempt whose deadline expired and was reassigned;
+- result from an attempt whose job was cancelled.
+
+The last two are the same mechanism reached through the new triggers, and are
+integration-tested.
+
+## Client cancellation
+
+A client may cancel any non-terminal job. QUEUED and RETRY_WAIT jobs move
+straight to the terminal `CANCELLED` state. A RUNNING job additionally has its
+lease revoked and a best-effort `TASK_CANCEL` sent to the worker, then becomes
+CANCELLED. Cancelling an already-terminal job is a no-op that reports the job's
+real final state; cancelling an unknown id is an error. Because cancellation
+revokes the lease, a worker that keeps running the cancelled task and later
+reports success is stale-rejected — a cancelled job never comes back.
 
 ## Worker re-registration
 
@@ -75,6 +117,13 @@ Job state is written through to SQLite before it is client-visible, so:
   requeues them — the crashed attempt still counts against the budget — or
   fails them if it was the final attempt, with an explicit error saying so.
   This is the at-least-once trade-off again, applied across restarts.
+
+The persisted `deadline` is a coordinator-clock instant from the **dead**
+process, so it means nothing to the new one. Recovery never treats a loaded
+`RUNNING` job as still-leased: it requeues (discarding the stale deadline
+along with the lease), and the fresh assignment gets a fresh deadline. A stale
+deadline can therefore never "instantly expire" a recovered job — verified by
+`CoordinatorRestartIT.recoveryIgnoresStaleDeadlineAndRequeuesInsteadOfExpiring`.
 
 Workers are not persisted (their sessions cannot survive anyway); they
 reconnect and re-register on their own retry loop. A worker that finished a
@@ -104,7 +153,8 @@ While the coordinator is down the system is unavailable — see below.
 |---|---|---|
 | worker `--heartbeat-interval-millis` | 2000 | heartbeat period |
 | coordinator `--heartbeat-timeout-millis` | 6000 | silence before suspected dead |
-| coordinator `--sweep-interval-millis` | 500 | failure scan + retry promotion + scheduling period |
+| coordinator `--sweep-interval-millis` | 500 | failure scan + deadline scan + retry promotion + scheduling period |
+| coordinator `--task-timeout-millis` | 600000 | per-attempt execution deadline (coordinator clock) |
 | coordinator `--max-attempts` | 3 | default attempt budget per job |
 | coordinator `--retry-base-delay-millis` / `--retry-max-delay-millis` | 1000 / 30000 | exponential backoff bounds |
 

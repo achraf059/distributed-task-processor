@@ -72,19 +72,27 @@ flowchart LR
 ```mermaid
 stateDiagram-v2
     [*] --> QUEUED : submit
-    QUEUED --> RUNNING : assigned (new attempt lease)
+    QUEUED --> RUNNING : assigned (new attempt lease + deadline)
     RUNNING --> COMPLETED : result accepted
-    RUNNING --> RETRY_WAIT : worker lost / task failed,<br/>attempts remain
+    RUNNING --> RETRY_WAIT : worker lost / task failed /<br/>deadline expired, attempts remain
     RUNNING --> FAILED : attempts exhausted
     RUNNING --> QUEUED : coordinator restart recovery
     RETRY_WAIT --> QUEUED : backoff elapsed
+    QUEUED --> CANCELLED : client cancel
+    RETRY_WAIT --> CANCELLED : client cancel
+    RUNNING --> CANCELLED : client cancel (lease revoked)
     COMPLETED --> [*]
     FAILED --> [*]
+    CANCELLED --> [*]
 ```
 
-Every assignment carries a fresh **attempt lease** (a UUID). A result is only
-accepted if it carries the job's *current* lease — results from workers that
-were declared dead and later resurface are logged and rejected. See
+Every assignment carries a fresh **attempt lease** (a UUID) that is
+**time-bounded**: it expires at a deadline measured on the coordinator's clock
+(`assignedAt + executionTimeout`). A result is only accepted if it carries the
+job's *current* lease — results from workers that were declared dead, timed
+out, or cancelled, and later resurface, are logged and rejected. When a lease
+expires the coordinator revokes it, best-effort asks the worker to stop
+(`TASK_CANCEL`), and retries the job. See
 [docs/FAILURE_MODEL.md](docs/FAILURE_MODEL.md).
 
 ## Requirements
@@ -120,6 +128,7 @@ well under a minute.
 ./scripts/client.sh submit sleep --milliseconds 30000
 ./scripts/client.sh status <job-id>
 ./scripts/client.sh wait <job-id>
+./scripts/client.sh cancel <job-id>
 ./scripts/client.sh list
 ./scripts/client.sh workers
 ```
@@ -128,6 +137,19 @@ Task types: `sleep --milliseconds N`, `word-count --text "..."`,
 `sha256 --text "..."`, `prime-count --limit N`, and
 `fail --fail-until-attempt N` (deliberately fails early attempts, for watching
 retries). Run any command without arguments to see usage.
+
+**Execution deadlines.** Each attempt has a coordinator-enforced execution
+deadline (`--task-timeout-millis`, default 10 minutes). A task that outlives it
+is treated like a lost attempt — the lease is revoked, the worker is asked to
+stop, and the job is retried — even if the worker is alive and heartbeating.
+This closes the gap where one wedged task would otherwise occupy a slot
+forever. To watch it, start the coordinator with a short timeout and submit a
+longer sleep:
+
+```bash
+./scripts/coordinator.sh --task-timeout-millis 3000
+./scripts/client.sh submit sleep --milliseconds 20000   # exceeds the 3s deadline
+```
 
 ## The failure-recovery demo
 
@@ -212,7 +234,9 @@ containers.
   multi-worker spread and true concurrency (asserted by elapsed time), worker
   failure via heartbeat silence *and* via abrupt disconnect, retry exhaustion,
   stale-result rejection in three variants, coordinator restart recovery
-  (including the final-attempt rule and worker auto-reconnect), a
+  (including the final-attempt rule, the stale-deadline rule, and worker
+  auto-reconnect), execution-deadline timeout on a healthy worker with
+  reassignment, client cancellation of queued and running jobs, a
   60-jobs/4-clients/5-workers scheduling race test asserting exactly one
   assignment per job, and malformed-bytes robustness on both ports.
 
@@ -227,6 +251,15 @@ containers.
 - **Failure suspicion, not proof.** A missed heartbeat means the worker is
   *suspected* dead under a timeout model; a slow-but-alive worker can be
   declared dead. Its late results are then rejected as stale.
+- **Execution deadline ≠ worker death.** A timed-out attempt means the *task*
+  exceeded its execution contract, not that the worker failed — the worker may
+  be healthy and heartbeating. Expiry is judged solely on the coordinator's
+  clock, so worker clocks need not be synchronized. The revoked attempt's late
+  result is rejected through the same lease check.
+- **Cancellation is cooperative.** `cancel` and deadline expiry revoke the lease
+  immediately and ask the worker to stop via thread interruption; a task that
+  ignores interruption keeps running but can no longer affect job state. This is
+  not guaranteed preemption, and it does not make execution exactly-once.
 - **Single coordinator.** The coordinator is a single point of failure;
   durability (not availability) is what restart recovery provides. Multiple
   coordinators would require leader election/consensus — out of scope, by
@@ -242,7 +275,11 @@ More detail in [docs/FAILURE_MODEL.md](docs/FAILURE_MODEL.md) and
 - One coordinator (see above); leader election is the natural next step.
 - Scheduling is FIFO / least-loaded; no priorities, deadlines, or fairness.
 - Results live in the job row; large results would need external storage.
-- No cancellation, backpressure, or per-task execution timeout yet.
+- No backpressure or bounded submission queue yet; the job set grows
+  unboundedly.
+- Cancellation is cooperative (thread interruption), not hard preemption: a
+  task that ignores interruption keeps running until it finishes, though its
+  lease is already revoked so its result is discarded.
 
 ## Documentation
 
