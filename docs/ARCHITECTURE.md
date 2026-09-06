@@ -67,6 +67,13 @@ DESIGN_DECISIONS.
 - **Attempt leases** — `Job.assignTo` issues a fresh UUID per assignment;
   `applyTaskResult` accepts a result only if the job is RUNNING *and* the
   lease matches. Everything else is logged as stale and dropped.
+- **Admission control** — an O(1) `activeJobCount` (non-terminal jobs) kept in
+  the core state. `submitJob` admits a new job only if the count is below
+  `max-active-jobs`, otherwise returns a typed `SUBMIT_REJECTED`; the count is
+  incremented on admission and decremented through the single `persistRetired`
+  chokepoint on any active→terminal transition. Because it lives on the
+  single-writer thread, the check-and-increment is atomic with no extra locking
+  — the same property that makes scheduling race-free.
 
 ### Persistence and recovery
 

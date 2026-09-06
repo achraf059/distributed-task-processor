@@ -132,6 +132,30 @@ recovery discarded the old lease.
 
 While the coordinator is down the system is unavailable — see below.
 
+## Overload (more work offered than the system can run)
+
+Overload is a *defined* condition, not an implicit degradation. The coordinator
+holds at most `--max-active-jobs` active (non-terminal) jobs; a submission that
+arrives at the limit is rejected with a typed, retryable `SUBMIT_REJECTED`
+rather than being queued (see [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) 14 and
+the measured before/after in [MEASURED_BEHAVIOR.md](MEASURED_BEHAVIOR.md)).
+
+- **Bounded, not unbounded.** Without a limit, offering work faster than the
+  workers can drain it grows the queue — and therefore both memory and the
+  latency of every admitted job — without bound. The limit caps the active set,
+  so admitted work has bounded latency and the coordinator has bounded memory.
+- **Existing work is safe.** Only new submissions are shed. Jobs already
+  accepted always run to a terminal state, and retries never re-enter admission
+  control, so overload can never cause the system to drop or fail work it had
+  already taken on.
+- **Recovery above a lowered limit.** If the coordinator restarts onto a
+  database holding more active jobs than a since-lowered limit, those jobs run
+  normally; only new submissions are rejected, until enough recovered jobs reach
+  a terminal state to bring the active count back below the limit.
+- **Not a fairness or QoS mechanism.** The limit is a single global count with
+  no per-client quota and no priority in what gets shed. It bounds load; it does
+  not arbitrate between competing clients.
+
 ## What is *not* tolerated
 
 - **Coordinator permanent loss**: single coordinator by design. The database
