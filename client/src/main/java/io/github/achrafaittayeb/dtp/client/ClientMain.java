@@ -27,6 +27,7 @@ import java.util.List;
  * client wait &lt;job-id&gt;
  * client list
  * client workers
+ * client bench --jobs 500 --concurrency 4
  * </pre>
  *
  * Global options: {@code --host} (default localhost), {@code --port} (default 7071),
@@ -64,6 +65,13 @@ public final class ClientMain {
                 rawArgs, 1 + positionals.size(), rawArgs.length));
         String host = options.get("host", "localhost");
         int port = options.getInt("port", 7071);
+
+        // bench manages its own connections (one per generator thread), so it
+        // does not go through the single shared client below.
+        if (command.equals("bench")) {
+            bench(host, port, options);
+            return;
+        }
 
         try (CoordinatorClient client = new CoordinatorClient(host, port)) {
             switch (command) {
@@ -118,6 +126,29 @@ public final class ClientMain {
         System.out.println("  ID:    " + jobId);
         System.out.println("  Type:  " + taskType);
         System.out.println("  State: QUEUED");
+    }
+
+    private static void bench(String host, int port, Args options) throws Exception {
+        TaskType taskType;
+        Bench.Config config;
+        try {
+            taskType = Bench.taskTypeFor(options.get("task", "sha256"));
+            config = new Bench.Config(
+                    host, port,
+                    options.getInt("jobs", 200),
+                    options.getInt("concurrency", 4),
+                    options.getInt("warmup", 25),
+                    taskType,
+                    Bench.payloadFor(taskType,
+                            options.getLong("sleep-millis", 1_000),
+                            options.getLong("prime-limit", 100_000)),
+                    options.getLong("wait-timeout-millis", 10 * 60 * 1000));
+        } catch (IllegalArgumentException badOption) {
+            throw new UsageException(badOption.getMessage());
+        }
+        System.out.printf("Benchmarking %s:%d — %d %s jobs, %d connections, %d warm-up jobs%n",
+                host, port, config.jobs(), taskType, config.concurrency(), config.warmupJobs());
+        new Bench(config).run().print(System.out);
     }
 
     private static void printJob(JobSnapshot job) {
@@ -214,6 +245,9 @@ public final class ClientMain {
                   cancel <job-id>
                   list
                   workers
+                  bench [--jobs <n>] [--concurrency <n>] [--warmup <n>]
+                        [--task sha256|sleep|prime-count] [--sleep-millis <ms>]
+                        [--prime-limit <n>] [--wait-timeout-millis <ms>]
                 Global options: --host <host> (default localhost), --port <port> (default 7071)
                 Submit options: --max-attempts <n> (default: coordinator setting)""");
     }
