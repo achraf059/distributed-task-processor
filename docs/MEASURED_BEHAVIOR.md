@@ -1,0 +1,109 @@
+# Measured Behavior
+
+This document records what the system actually does under load, measured with
+the built-in `client bench` load generator. It is written in two parts: the
+**baseline** (the unbounded system, before admission control) and the
+**post-change** results (after `--max-active-jobs` was added). The engineering
+point of the exercise is not a big throughput number — it is turning *undefined*
+overload behavior into *defined* overload behavior, and being able to show the
+before/after.
+
+## What the benchmark is, honestly
+
+`client bench` is a **local engineering benchmark**, not a rigorous performance
+benchmark. Read the numbers as "this system compared against itself under
+different configurations", never as absolute capacity claims. Specifically:
+
+- The load generator and the system under test share one machine, so they
+  compete for the same cores.
+- Submit-acknowledgement latency is a genuine request/response round-trip.
+  End-to-end latency (submit → observed terminal) is measured by **polling job
+  status every 20 ms**, so it is an *upper bound* quantized by that interval,
+  not a precise completion timestamp.
+- Warm-up is approximated by an untimed batch of jobs before the timed phase,
+  so the timed phase is not measuring a stone-cold JIT. It is not a rigorous
+  steady-state warm-up.
+- Percentiles are nearest-rank over the run's samples. No attempt is made to
+  correct for coordinated omission.
+
+Every number below was produced on the machine described next. Nothing is
+fabricated or extrapolated.
+
+## Environment
+
+| | |
+|---|---|
+| Machine | Apple M1 Pro, 8 cores, 16 GB RAM |
+| OS | macOS 15.7.2 |
+| JDK | 23 (Temurin), project compiled `--release 21` |
+| Coordinator | 1 process, default timings |
+| Workers | 3 processes, capacity 4 each → **12 concurrent execution slots** |
+| Client | `client bench`, connections = `--concurrency` |
+| Persistence | SQLite file (durable) and `:memory:` (non-durable), as noted per run |
+
+Reproduce with (three workers of `--capacity 4`, then):
+
+```bash
+client bench --task sha256   --jobs 2000 --concurrency 4 --warmup 50
+client bench --task sleep --sleep-millis 500 --jobs 240 --concurrency 8 --warmup 5
+```
+
+## Baseline: the unbounded system
+
+### 1. Cost of durable write-through (SHA256, 2000 jobs, concurrency 4)
+
+`sha256` is a cheap, CPU-bound, deterministic task, so this run is dominated by
+coordinator bookkeeping and persistence rather than task execution.
+
+| Persistence | Throughput | Submit ack p50 / p99 | End-to-end p50 / p99 |
+|---|---|---|---|
+| SQLite file (durable) | **896 jobs/s** | 4.2 / 6.4 ms | 1110 / 2142 ms |
+| `:memory:` (non-durable) | **4843 jobs/s** | 0.5 / 2.2 ms | 165 / 341 ms |
+
+**Finding.** Durable write-through costs roughly **5.4× throughput** here (896
+vs 4843 jobs/s). Every job state transition is written through to SQLite
+synchronously on the single coordinator core thread (QUEUED → RUNNING →
+COMPLETED is several writes), and those synchronous writes — not the SHA-256
+work — are the bottleneck for cheap tasks. This is the price of the durability
+guarantee that makes coordinator restart recovery possible, and it is a
+deliberate, documented trade-off (see
+[DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) ADR 7). The comparison is valid
+because *only* the repository implementation changes between the two runs;
+everything else is identical.
+
+### 2. Overload behavior (sleep 500 ms, 240 jobs, concurrency 8)
+
+With 12 execution slots and 500 ms tasks, the system's sustained service rate is
+about `12 / 0.5 s = 24 jobs/s`. Submitting 240 such jobs deliberately exceeds
+what the workers can service concurrently, so the excess must go *somewhere*.
+
+| | Value |
+|---|---|
+| Accepted | 240 / 240 (nothing rejected) |
+| Throughput | 23.6 jobs/s (≈ the 24 jobs/s slot ceiling, as expected) |
+| **Submit ack** p50 / p99 | **3.9 / 19.1 ms** (fast and flat) |
+| **End-to-end** p50 / p99 / max | **5040 / 10028 / 10039 ms** |
+
+**Finding — this is the limitation the milestone fixes.** The coordinator
+accepts *all* 240 jobs almost instantly (submit ack stays around 4 ms), while
+end-to-end latency climbs to ~5 s at the median and ~10 s at the tail. The two
+numbers diverge because the excess work is silently buffered in the coordinator:
+
+- **The client gets no backpressure signal.** A fast "accepted" is returned
+  regardless of how deep the queue already is, so a client (or a retry storm, or
+  a burst of clients) can pile on unboundedly. The in-memory `jobs` map and the
+  SQLite table both grow with every accepted job.
+- **End-to-end latency grows with queue depth**, not with the task itself. A
+  500 ms task takes 10 s to finish once it is 20 waves deep. This is Little's
+  law in miniature: with arrival rate above service rate, the queue — and
+  therefore the wait — grows without bound until submission stops.
+- **Nothing pushes back and nothing sheds load.** The only reason the run ended
+  at all is that the benchmark submitted a finite batch. A truly open-loop
+  source would drive latency and memory up indefinitely.
+
+The pathology is not "the system is slow" — 24 jobs/s is exactly the honest slot
+ceiling. The pathology is that **overload has no defined behavior**: the system
+neither refuses work nor signals that it is saturated. That is what admission
+control changes.
+
+<!-- POST-CHANGE RESULTS APPENDED IN A LATER COMMIT -->
