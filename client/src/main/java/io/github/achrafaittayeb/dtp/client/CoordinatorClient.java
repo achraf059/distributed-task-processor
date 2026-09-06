@@ -17,6 +17,7 @@ import io.github.achrafaittayeb.dtp.common.protocol.ListJobs;
 import io.github.achrafaittayeb.dtp.common.protocol.ListWorkers;
 import io.github.achrafaittayeb.dtp.common.protocol.Message;
 import io.github.achrafaittayeb.dtp.common.protocol.SubmitJob;
+import io.github.achrafaittayeb.dtp.common.protocol.SubmitRejected;
 import io.github.achrafaittayeb.dtp.common.protocol.WorkerListReply;
 
 import java.io.IOException;
@@ -44,12 +45,23 @@ public final class CoordinatorClient implements AutoCloseable {
         this.out = socket.getOutputStream();
     }
 
-    /** Submits a job; returns its id. {@code maxAttempts <= 0} uses the server default. */
+    /**
+     * Submits a job; returns its id. {@code maxAttempts <= 0} uses the server
+     * default.
+     *
+     * @throws SubmitRejectedException if the coordinator is at its active-job
+     *     limit (a valid request refused under overload — distinct from a
+     *     malformed-request error, and safe to retry after a back-off)
+     * @throws IOException on any other error reply or transport failure
+     */
     public synchronized String submit(TaskType taskType, JsonNode payload, int maxAttempts)
             throws IOException {
         Message reply = exchange(new SubmitJob(taskType, payload, maxAttempts));
         if (reply instanceof JobSubmitted submitted) {
             return submitted.jobId();
+        }
+        if (reply instanceof SubmitRejected rejected) {
+            throw new SubmitRejectedException(rejected);
         }
         throw asError(reply);
     }

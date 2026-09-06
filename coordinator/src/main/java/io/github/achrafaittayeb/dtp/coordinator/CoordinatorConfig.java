@@ -20,6 +20,7 @@ public record CoordinatorConfig(
         int defaultMaxAttempts,
         long retryBaseDelayMillis,
         long retryMaxDelayMillis,
+        int maxActiveJobs,
         String databasePath) {
 
     public static final int DEFAULT_WORKER_PORT = 7070;
@@ -33,6 +34,14 @@ public record CoordinatorConfig(
     public static final int DEFAULT_MAX_ATTEMPTS = 3;
     public static final long DEFAULT_RETRY_BASE_DELAY_MILLIS = 1_000;
     public static final long DEFAULT_RETRY_MAX_DELAY_MILLIS = 30_000;
+    /**
+     * Admission ceiling: the coordinator holds at most this many active
+     * (non-terminal) jobs before it rejects new submissions. Chosen to sit
+     * comfortably above any hand-driven or demo workload while still bounding
+     * coordinator memory and per-sweep work on a single node; tune it down to
+     * observe load shedding.
+     */
+    public static final int DEFAULT_MAX_ACTIVE_JOBS = 10_000;
     public static final String DEFAULT_DATABASE_PATH = "data/coordinator.db";
 
     /** Path {@code :memory:} selects the non-durable in-memory repository. */
@@ -49,6 +58,7 @@ public record CoordinatorConfig(
                 parsed.getInt("max-attempts", DEFAULT_MAX_ATTEMPTS),
                 parsed.getLong("retry-base-delay-millis", DEFAULT_RETRY_BASE_DELAY_MILLIS),
                 parsed.getLong("retry-max-delay-millis", DEFAULT_RETRY_MAX_DELAY_MILLIS),
+                parsed.getInt("max-active-jobs", DEFAULT_MAX_ACTIVE_JOBS),
                 parsed.get("database", DEFAULT_DATABASE_PATH));
     }
 
@@ -62,6 +72,9 @@ public record CoordinatorConfig(
         }
         if (defaultMaxAttempts < 1) {
             throw new IllegalArgumentException("max-attempts must be >= 1");
+        }
+        if (maxActiveJobs < 1) {
+            throw new IllegalArgumentException("max-active-jobs must be >= 1");
         }
     }
 }

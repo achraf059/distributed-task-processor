@@ -121,7 +121,17 @@ public final class ClientMain {
             default -> throw new UsageException("Unknown task type: " + positionals.getFirst());
         };
 
-        String jobId = client.submit(taskType, payload, options.getInt("max-attempts", 0));
+        String jobId;
+        try {
+            jobId = client.submit(taskType, payload, options.getInt("max-attempts", 0));
+        } catch (SubmitRejectedException rejected) {
+            System.err.println("Submission rejected (coordinator overloaded): " + rejected.getMessage());
+            System.err.println("  Active jobs: " + rejected.activeCount()
+                    + " (limit " + rejected.limit() + ")");
+            System.err.println("  Retryable: back off and submit again once load subsides.");
+            System.exit(3);
+            return;
+        }
         System.out.println("Job submitted");
         System.out.println("  ID:    " + jobId);
         System.out.println("  Type:  " + taskType);

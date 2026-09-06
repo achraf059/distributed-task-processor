@@ -30,18 +30,27 @@ final class Testbed {
     }
 
     /** Coordinator on ephemeral ports; {@code database} may be {@code :memory:} or a temp file. */
+    /** Large enough that admission control never fires unless a test asks it to. */
+    static final int UNLIMITED_ACTIVE_JOBS = 1_000_000;
+
     static Coordinator startCoordinator(String database, int maxAttempts) throws IOException {
         return startCoordinator(database, maxAttempts, TASK_TIMEOUT_MILLIS);
     }
 
     static Coordinator startCoordinator(String database, int maxAttempts, long taskTimeoutMillis)
             throws IOException {
+        return startCoordinator(database, maxAttempts, taskTimeoutMillis, UNLIMITED_ACTIVE_JOBS);
+    }
+
+    static Coordinator startCoordinator(String database, int maxAttempts, long taskTimeoutMillis,
+                                        int maxActiveJobs) throws IOException {
         Coordinator coordinator = new Coordinator(new CoordinatorConfig(
                 0, 0,
                 HEARTBEAT_TIMEOUT_MILLIS, SWEEP_INTERVAL_MILLIS,
                 taskTimeoutMillis,
                 maxAttempts,
                 50, 200,
+                maxActiveJobs,
                 database));
         coordinator.start();
         return coordinator;

@@ -230,10 +230,16 @@ public final class Bench {
             Deque<PendingJob> pending = new ArrayDeque<>();
             for (int i = 0; i < jobsToSubmit; i++) {
                 long before = System.nanoTime();
-                String jobId = client.submit(config.taskType(), config.payload(), 0);
-                submitAckNanos.add(System.nanoTime() - before);
-                accepted++;
-                pending.add(new PendingJob(jobId, before));
+                try {
+                    String jobId = client.submit(config.taskType(), config.payload(), 0);
+                    // Submit-ack latency is recorded for accepted jobs only, so the
+                    // percentiles describe the cost of admitting real work.
+                    submitAckNanos.add(System.nanoTime() - before);
+                    accepted++;
+                    pending.add(new PendingJob(jobId, before));
+                } catch (SubmitRejectedException overloaded) {
+                    rejected++;
+                }
             }
             return pending;
         }

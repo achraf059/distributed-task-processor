@@ -58,6 +58,22 @@ public final class CoordinatorCore implements AutoCloseable {
     private final Map<String, Job> jobs = new HashMap<>();
     private final ScheduledExecutorService coreThread;
 
+    /**
+     * Number of active (non-terminal) jobs: QUEUED + RETRY_WAIT + RUNNING. Kept
+     * as a running counter — never recomputed by scanning {@link #jobs} — so the
+     * admission check in {@link #submitJob} stays O(1) even under overload, when
+     * scanning would be most expensive. Confined to the core thread, so the
+     * increment/decrement need no synchronization: the single-writer design that
+     * already prevents double-assignment also makes this counter race-free.
+     *
+     * <p>Invariant: it is incremented exactly once when a job enters the active
+     * set (a new submission, or a non-terminal job recovered from storage) and
+     * decremented exactly once when a job leaves it (any active → terminal
+     * transition, funnelled through {@link #persistRetired}). Retries stay
+     * active (RUNNING → RETRY_WAIT → QUEUED) and never touch it.
+     */
+    private int activeJobCount;
+
     public CoordinatorCore(CoordinatorConfig config, JobRepository repository) {
         this.config = config;
         this.repository = repository;
@@ -115,20 +131,52 @@ public final class CoordinatorCore implements AutoCloseable {
     // Requests from client connections (block until the core thread answers)
     // ------------------------------------------------------------------
 
-    public String submitJob(TaskType taskType, JsonNode payload, int requestedMaxAttempts)
+    /** Outcome of a submission: either accepted (with a job id) or rejected because the coordinator is at its active-job limit. */
+    public record SubmitOutcome(boolean accepted, String jobId, int activeCount, int limit) {
+
+        static SubmitOutcome accepted(String jobId, int activeCount, int limit) {
+            return new SubmitOutcome(true, jobId, activeCount, limit);
+        }
+
+        static SubmitOutcome rejected(int activeCount, int limit) {
+            return new SubmitOutcome(false, null, activeCount, limit);
+        }
+    }
+
+    /**
+     * Admission point for new work. A malformed payload is rejected up front
+     * (before the core thread) as {@link InvalidPayloadException}. A well-formed
+     * request is admitted only if the active-job count is below the configured
+     * limit; otherwise it is shed with a {@link SubmitOutcome#rejected} outcome —
+     * the coordinator refuses new work rather than buffering it unboundedly.
+     * Only fresh submissions pass through here; retries never do.
+     */
+    public SubmitOutcome submitJob(TaskType taskType, JsonNode payload, int requestedMaxAttempts)
             throws InvalidPayloadException {
         TaskPayloads.validate(taskType, payload);
         int maxAttempts = requestedMaxAttempts > 0 ? requestedMaxAttempts : config.defaultMaxAttempts();
         return askCore(() -> {
+            int limit = config.maxActiveJobs();
+            if (activeJobCount >= limit) {
+                log.warn("Job submission rejected (overloaded): activeJobs={} limit={} type={}",
+                        activeJobCount, limit, taskType);
+                return SubmitOutcome.rejected(activeJobCount, limit);
+            }
             Job job = Job.createQueued(taskType, payload, maxAttempts,
                     config.taskTimeoutMillis(), now());
             jobs.put(job.id(), job);
+            activeJobCount++;
             repository.save(job);
-            log.info("Job submitted: jobId={} type={} maxAttempts={}",
-                    job.id(), taskType, maxAttempts);
+            log.info("Job submitted: jobId={} type={} maxAttempts={} activeJobs={}/{}",
+                    job.id(), taskType, maxAttempts, activeJobCount, limit);
             scheduleQueuedJobs();
-            return job.id();
+            return SubmitOutcome.accepted(job.id(), activeJobCount, limit);
         });
+    }
+
+    /** Observability/test hook: current number of active (non-terminal) jobs, read on the core thread. */
+    public int activeJobCount() {
+        return askCore(() -> activeJobCount);
     }
 
     public Optional<JobSnapshot> getJob(String jobId) {
@@ -156,7 +204,7 @@ public final class CoordinatorCore implements AutoCloseable {
             String attemptId = job.currentAttemptId();
             String workerId = job.assignedWorkerId();
             job.cancel(now());
-            repository.save(job);
+            persistRetired(job);
             revokeAttemptOnWorker(jobId, attemptId, workerId, "cancelled by client");
             log.info("Job cancelled by client: jobId={} previousWorker={}", jobId, workerId);
             return new CancelOutcome(true, true, job.snapshot());
@@ -284,12 +332,14 @@ public final class CoordinatorCore implements AutoCloseable {
             job.scheduleRetry(attemptError, now + delay, now);
             log.info("Retry scheduled: jobId={} attempt={}/{} delayMillis={} cause=\"{}\"",
                     job.id(), job.attempts(), job.maxAttempts(), delay, attemptError);
+            // Still active (RETRY_WAIT): the active-job count is unchanged.
+            repository.save(job);
         } else {
             job.failPermanently(attemptError + " (all " + job.maxAttempts() + " attempts used)", now);
             log.warn("Job failed permanently: jobId={} attempts={} error=\"{}\"",
                     job.id(), job.attempts(), attemptError);
+            persistRetired(job);
         }
-        repository.save(job);
     }
 
     private void promoteDueRetries() {
@@ -356,7 +406,7 @@ public final class CoordinatorCore implements AutoCloseable {
         }
         if (result.success()) {
             job.complete(result.result(), now());
-            repository.save(job);
+            persistRetired(job);
             log.info("Job completed: jobId={} workerId={} attempts={}",
                     job.id(), result.workerId(), job.attempts());
         } else {
@@ -397,8 +447,17 @@ public final class CoordinatorCore implements AutoCloseable {
                 repository.save(job);
             }
             jobs.put(job.id(), job);
+            // Seed the active-job counter from each job's post-recovery state, so
+            // admission control resumes with an exact count. A restart may leave
+            // activeJobCount above a since-lowered limit; that is intended — the
+            // recovered jobs run, and only new submissions are rejected until the
+            // count drops back below the limit.
+            if (!job.state().isTerminal()) {
+                activeJobCount++;
+            }
         }
-        log.info("Recovery completed: {} jobs loaded, {} requeued", stored.size(), requeued);
+        log.info("Recovery completed: {} jobs loaded, {} requeued, {} active",
+                stored.size(), requeued, activeJobCount);
     }
 
     // ------------------------------------------------------------------
@@ -407,6 +466,23 @@ public final class CoordinatorCore implements AutoCloseable {
 
     private long now() {
         return System.currentTimeMillis();
+    }
+
+    /**
+     * The single place a job leaves the active set. Every active → terminal
+     * transition (completion, permanent failure, cancellation) is persisted
+     * through here so {@link #activeJobCount} is decremented exactly once, in one
+     * spot, regardless of which path retired the job. The guard makes underflow
+     * impossible: the counter can never go negative even if a transition were
+     * ever double-applied.
+     */
+    private void persistRetired(Job job) {
+        if (activeJobCount > 0) {
+            activeJobCount--;
+        } else {
+            log.error("activeJobCount underflow prevented while retiring job {}", job.id());
+        }
+        repository.save(job);
     }
 
     private void runOnCore(Runnable event) {
