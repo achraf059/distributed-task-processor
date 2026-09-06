@@ -55,6 +55,11 @@ public final class Coordinator implements AutoCloseable {
         return clientServer.port();
     }
 
+    /** Current number of active (non-terminal) jobs; the admission-control counter. */
+    public int activeJobCount() {
+        return core.activeJobCount();
+    }
+
     @Override
     public void close() {
         // Stop the brain first: after this, disconnect events from closing

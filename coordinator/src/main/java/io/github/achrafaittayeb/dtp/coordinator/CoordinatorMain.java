@@ -29,6 +29,7 @@ public final class CoordinatorMain {
                       --max-attempts <n>                default 3
                       --retry-base-delay-millis <ms>    default 1000
                       --retry-max-delay-millis <ms>     default 30000
+                      --max-active-jobs <n>             default 10000 (admission limit)
                       --database <path|:memory:>        default data/coordinator.db""");
             System.exit(2);
             return;

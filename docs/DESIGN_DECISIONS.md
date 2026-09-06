@@ -160,3 +160,50 @@ What this explicitly does **not** buy: it is not exactly-once (a timed-out task
 that actually finished still causes a retry — the at-least-once window is
 unchanged), and it is not a real-time guarantee (detection latency is bounded
 only by the sweep interval).
+
+## 14. Bounded admission (reject-new over buffer-forever)
+
+Before this decision the coordinator accepted every well-formed submission. The
+[measured baseline](MEASURED_BEHAVIOR.md) showed the consequence: under a
+sustained overload the submit acknowledgement stayed ~4 ms while end-to-end
+latency climbed to ~10 s, because excess work was silently buffered in an
+in-memory map and a growing SQLite table. The coordinator had no *defined*
+overload behavior. `--max-active-jobs` gives it one: at the limit, new
+submissions are rejected.
+
+- **Reject new, don't buffer forever.** An unbounded queue converts overload
+  into unbounded latency and unbounded memory (Little's law: with arrival rate
+  above service rate, the backlog grows without limit). Shedding the excess
+  keeps admitted work's latency bounded and the coordinator's footprint bounded.
+  The measured result is a ~10× lower overload tail on admitted jobs, with the
+  overflow surfaced as explicit rejections instead of hidden delay.
+- **Why not block the client instead?** Blocking the submit call until a slot
+  frees just moves the unbounded queue into the clients' threads and hides the
+  saturation behind apparent slowness. An explicit, typed, retryable rejection
+  puts the backpressure decision where the client can see and act on it (retry
+  with back-off, shed, or route elsewhere).
+- **Why not drop already-accepted work?** Admission bounds *intake*; it never
+  discards work the system already promised to run. Dropping accepted jobs would
+  break the durability and at-least-once guarantees the rest of the design is
+  built on. So only new submissions are gated, and retries — which are
+  already-accepted work — never re-enter admission control.
+- **A typed message, not `ERROR`.** Overload rejection is retryable; a
+  malformed request is not. Collapsing them into one `ERROR` would force clients
+  to parse strings to tell "back off and retry" from "your request is broken".
+  `SUBMIT_REJECTED` carries `activeCount`/`limit`/`retryable` so the distinction
+  is structural.
+- **O(1), and race-free for free.** The active-job count is a single integer
+  maintained in the core's state, incremented when a job enters the active set
+  and decremented through one `persistRetired` chokepoint when it leaves — never
+  recomputed by scanning the job map, which would make admission most expensive
+  exactly under the load it is meant to protect against. Because every state
+  mutation already runs on the single-writer core thread (decision 3), the
+  check-and-increment needs no lock and cannot race: the same design that
+  prevents double-assignment also makes "admit iff below the limit" atomic
+  without any new machinery. The 8-client boundary test admits *exactly* the
+  limit for this reason.
+
+What this explicitly does **not** buy: it is not fairness (a single global limit
+with no per-client quota or priority in what gets shed) and it does not raise
+throughput (the service rate is still the workers' slot ceiling) — the point is
+*defined* overload behavior, not a faster system.

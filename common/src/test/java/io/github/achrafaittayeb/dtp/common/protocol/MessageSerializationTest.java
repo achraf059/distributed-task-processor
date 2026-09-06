@@ -82,4 +82,21 @@ class MessageSerializationTest {
         byte[] garbage = {0x00, 0x01, 0x7F, (byte) 0xFF};
         assertThatThrownBy(() -> MessageIO.decode(garbage)).isInstanceOf(ProtocolException.class);
     }
+
+    @Test
+    void roundTripsSubmitRejected() throws IOException {
+        SubmitRejected rejected = SubmitRejected.overloaded(10, 10);
+        SubmitRejected decoded = (SubmitRejected) roundTrip(rejected);
+        assertThat(decoded).isEqualTo(rejected);
+        assertThat(decoded.activeCount()).isEqualTo(10);
+        assertThat(decoded.limit()).isEqualTo(10);
+        assertThat(decoded.retryable()).isTrue();
+    }
+
+    @Test
+    void submitRejectedCarriesTypeDiscriminator() throws IOException {
+        String json = new String(MessageIO.encode(SubmitRejected.overloaded(3, 3)),
+                StandardCharsets.UTF_8);
+        assertThat(json).contains("\"type\":\"SUBMIT_REJECTED\"");
+    }
 }

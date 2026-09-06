@@ -123,6 +123,10 @@ final class ScriptedWorker implements AutoCloseable {
         sendResult(TaskResult.success(workerId, assign.jobId(), assign.attemptId(), result));
     }
 
+    void sendFailure(TaskAssign assign, String error) throws IOException {
+        sendResult(TaskResult.failure(workerId, assign.jobId(), assign.attemptId(), error));
+    }
+
     void sendResult(TaskResult result) throws IOException {
         synchronized (out) {
             MessageIO.send(out, result);

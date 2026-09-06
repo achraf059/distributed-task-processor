@@ -64,8 +64,8 @@ flowchart LR
   heartbeat thread, five built-in task types.
 - **client** — CLI (`submit`, `status`, `wait`, `list`, `workers`) and a small
   reusable client library.
-- **integration-tests** — 18 end-to-end tests, including worker failure,
-  stale results, coordinator restart, and concurrency safety.
+- **integration-tests** — end-to-end tests, including worker failure,
+  stale results, coordinator restart, admission control, and concurrency safety.
 
 ### Job lifecycle
 
@@ -131,6 +131,7 @@ well under a minute.
 ./scripts/client.sh cancel <job-id>
 ./scripts/client.sh list
 ./scripts/client.sh workers
+./scripts/client.sh bench --jobs 2000 --concurrency 4   # load generator
 ```
 
 Task types: `sleep --milliseconds N`, `word-count --text "..."`,
@@ -150,6 +151,62 @@ longer sleep:
 ./scripts/coordinator.sh --task-timeout-millis 3000
 ./scripts/client.sh submit sleep --milliseconds 20000   # exceeds the 3s deadline
 ```
+
+## Load generation and overload control
+
+The client includes a small concurrent load generator for measuring the system
+against itself:
+
+```bash
+./scripts/client.sh bench --jobs 2000 --concurrency 4 --task sha256
+```
+
+It submits the requested jobs across `--concurrency` independent connections
+(one blocking client per thread), waits for every job to reach a terminal state,
+and reports throughput, submit-acknowledgement latency, and end-to-end
+submit-to-terminal latency as p50/p95/p99, plus accepted/rejected counts. It is
+a **local engineering benchmark** for comparing configurations, not a rigorous
+performance benchmark — see [docs/MEASURED_BEHAVIOR.md](docs/MEASURED_BEHAVIOR.md)
+for methodology, honest limitations, and the measured numbers below.
+
+**Admission control (backpressure).** The coordinator holds at most
+`--max-active-jobs` active (non-terminal: `QUEUED` + `RETRY_WAIT` + `RUNNING`)
+jobs, defaulting to 10 000. A submission that arrives at the limit is **rejected
+with a typed `SUBMIT_REJECTED` reply** (distinct from a malformed-request error,
+and marked retryable) rather than being buffered — the coordinator sheds excess
+load instead of letting its queue and memory grow without bound. The active-job
+count is an O(1) counter maintained inside the single-writer core, so the
+admission check stays cheap even under heavy load. Overload semantics:
+
+- Only **new** submissions are admission-controlled; work already in the system
+  is never discarded.
+- **Retries never re-enter admission control** — a retrying job is already
+  counted as active and stays counted across `RUNNING → RETRY_WAIT → RUNNING`.
+- Completion, permanent failure, and cancellation each free exactly one slot.
+- After a restart the coordinator may hold **more active jobs than a
+  since-lowered limit**; the recovered jobs run to completion normally, and only
+  *new* submissions are rejected until the count falls back below the limit.
+
+Watch it shed load with no workers running (jobs stay `QUEUED`, so they stay
+active):
+
+```bash
+./scripts/coordinator.sh --max-active-jobs 3
+./scripts/client.sh submit sleep --milliseconds 60000   # x4; the 4th is rejected
+```
+
+**Measured overload behavior** (Apple M1 Pro, 3 workers × capacity 4 = 12 slots,
+240× 500 ms sleep jobs from 8 connections; full methodology in the doc):
+
+| | Unbounded (baseline) | `--max-active-jobs 24` |
+|---|---|---|
+| Accepted / rejected | 240 / 0 | 24 / 216 |
+| End-to-end latency p99 | ~10.0 s | ~1.0 s |
+
+The change does not raise peak throughput (that was always the honest 12-slot
+ceiling of ~24 jobs/s); it makes overload **defined** — admitted work has
+bounded latency, and excess load is refused explicitly instead of silently
+queued.
 
 ## The failure-recovery demo
 
@@ -238,7 +295,11 @@ containers.
   auto-reconnect), execution-deadline timeout on a healthy worker with
   reassignment, client cancellation of queued and running jobs, a
   60-jobs/4-clients/5-workers scheduling race test asserting exactly one
-  assignment per job, and malformed-bytes robustness on both ports.
+  assignment per job, malformed-bytes robustness on both ports, and admission
+  control (accept-to-limit then typed rejection, slot accounting across
+  completion / failure / cancellation / retry, an 8-client race admitting
+  exactly the limit, and recovery of the active-job count including above a
+  lowered limit).
 
 ## Semantics, honestly stated
 
@@ -260,6 +321,11 @@ containers.
   immediately and ask the worker to stop via thread interruption; a task that
   ignores interruption keeps running but can no longer affect job state. This is
   not guaranteed preemption, and it does not make execution exactly-once.
+- **Overload is shed, not absorbed.** Beyond `--max-active-jobs` the
+  coordinator refuses new submissions with a typed, retryable `SUBMIT_REJECTED`
+  rather than queueing them. This bounds the coordinator's memory and the
+  latency of admitted work; it does *not* raise throughput, and it applies only
+  to new work — jobs already in the system always run to a terminal state.
 - **Single coordinator.** The coordinator is a single point of failure;
   durability (not availability) is what restart recovery provides. Multiple
   coordinators would require leader election/consensus — out of scope, by
@@ -275,8 +341,9 @@ More detail in [docs/FAILURE_MODEL.md](docs/FAILURE_MODEL.md) and
 - One coordinator (see above); leader election is the natural next step.
 - Scheduling is FIFO / least-loaded; no priorities, deadlines, or fairness.
 - Results live in the job row; large results would need external storage.
-- No backpressure or bounded submission queue yet; the job set grows
-  unboundedly.
+- Admission is a single global active-job limit (`--max-active-jobs`); there is
+  no per-client fairness or priority in what gets shed, and the client does not
+  yet auto-retry rejections (it surfaces them for the caller to handle).
 - Cancellation is cooperative (thread interruption), not hard preemption: a
   task that ignores interruption keeps running until it finishes, though its
   lease is already revoked so its result is discarded.
@@ -287,3 +354,4 @@ More detail in [docs/FAILURE_MODEL.md](docs/FAILURE_MODEL.md) and
 - [docs/PROTOCOL.md](docs/PROTOCOL.md) — framing, message schemas, error handling
 - [docs/FAILURE_MODEL.md](docs/FAILURE_MODEL.md) — failure scenarios and guarantees
 - [docs/DESIGN_DECISIONS.md](docs/DESIGN_DECISIONS.md) — ADR-style rationale
+- [docs/MEASURED_BEHAVIOR.md](docs/MEASURED_BEHAVIOR.md) — load-generator methodology and measured throughput / overload behavior

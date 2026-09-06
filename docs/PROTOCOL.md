@@ -58,12 +58,22 @@ connection.
 
 | Request | Reply | Notes |
 |---|---|---|
-| `SUBMIT_JOB` (`taskType`, `payload`, `maxAttempts`) | `JOB_SUBMITTED` (`jobId`) | `maxAttempts ≤ 0` → server default; payload validated before the job exists |
+| `SUBMIT_JOB` (`taskType`, `payload`, `maxAttempts`) | `JOB_SUBMITTED` (`jobId`) or `SUBMIT_REJECTED` | `maxAttempts ≤ 0` → server default; payload validated before the job exists; rejected if the coordinator is at its active-job limit (see below) |
 | `GET_JOB_STATUS` (`jobId`) | `JOB_STATUS` (job snapshot) | unknown id → `ERROR` |
 | `LIST_JOBS` | `JOB_LIST` (snapshots, newest first) | |
 | `LIST_WORKERS` | `WORKER_LIST` (live workers) | |
 | `CANCEL_JOB` (`jobId`) | `JOB_CANCEL` (`cancelled`, job snapshot) | `cancelled=true` if this call moved it to CANCELLED; `false` if already terminal (snapshot shows real state); unknown id → `ERROR` |
 | any invalid | `ERROR` (`message`) | malformed frames get a best-effort `ERROR`, then close |
+
+**`SUBMIT_REJECTED` (`reason`, `activeCount`, `limit`, `retryable`)** is the
+reply to a *well-formed* `SUBMIT_JOB` that the coordinator refuses because it is
+already holding `--max-active-jobs` active (non-terminal) jobs. It is a distinct
+message from `ERROR` on purpose: `ERROR` means "your request was wrong, do not
+resend it as-is", whereas `SUBMIT_REJECTED` means "your request was fine, the
+coordinator is overloaded — back off and retry". `retryable` is always `true`;
+`activeCount` and `limit` let the client report or adapt. Only new submissions
+are gated this way; retries of already-accepted jobs never pass through
+admission control.
 
 A job snapshot contains: `jobId`, `taskType`, `state` (one of QUEUED, RUNNING,
 RETRY_WAIT, COMPLETED, FAILED, CANCELLED), `attempts`, `maxAttempts`,

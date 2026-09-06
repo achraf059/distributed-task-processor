@@ -13,6 +13,7 @@ import io.github.achrafaittayeb.dtp.common.protocol.ListJobs;
 import io.github.achrafaittayeb.dtp.common.protocol.ListWorkers;
 import io.github.achrafaittayeb.dtp.common.protocol.Message;
 import io.github.achrafaittayeb.dtp.common.protocol.SubmitJob;
+import io.github.achrafaittayeb.dtp.common.protocol.SubmitRejected;
 import io.github.achrafaittayeb.dtp.common.protocol.WorkerListReply;
 import io.github.achrafaittayeb.dtp.common.task.InvalidPayloadException;
 import io.github.achrafaittayeb.dtp.coordinator.CoordinatorCore;
@@ -105,8 +106,13 @@ public final class ClientServer implements AutoCloseable {
     private Message handle(Message request) {
         try {
             return switch (request) {
-                case SubmitJob submit -> new JobSubmitted(
-                        core.submitJob(submit.taskType(), submit.payload(), submit.maxAttempts()));
+                case SubmitJob submit -> {
+                    CoordinatorCore.SubmitOutcome outcome = core.submitJob(
+                            submit.taskType(), submit.payload(), submit.maxAttempts());
+                    yield outcome.accepted()
+                            ? new JobSubmitted(outcome.jobId())
+                            : SubmitRejected.overloaded(outcome.activeCount(), outcome.limit());
+                }
                 case GetJobStatus status -> core.getJob(status.jobId())
                         .<Message>map(JobStatusReply::new)
                         .orElseGet(() -> new ErrorReply("Unknown job: " + status.jobId()));
