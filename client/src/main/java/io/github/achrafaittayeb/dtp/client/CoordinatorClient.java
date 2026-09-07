@@ -80,13 +80,27 @@ public final class CoordinatorClient implements AutoCloseable {
      */
     public String submit(TaskType taskType, JsonNode payload, int maxAttempts)
             throws IOException {
-        return submitRetrier.submit(() -> submitOnce(taskType, payload, maxAttempts));
+        return submit(taskType, payload, maxAttempts, null);
+    }
+
+    /**
+     * Submits with an optional idempotency key. A {@code null} key is the
+     * historical behavior (always a fresh job). A non-null, stable key lets the
+     * coordinator deduplicate: resubmitting the same key returns the original
+     * job's id instead of creating another logical job. Resubmitting a key that
+     * the coordinator bound to a <em>different</em> request (task type, payload,
+     * or max attempts) is a conflict, surfaced as a plain {@link IOException} —
+     * not a {@link SubmitRejectedException}, so the retry loop never retries it.
+     */
+    public String submit(TaskType taskType, JsonNode payload, int maxAttempts, String idempotencyKey)
+            throws IOException {
+        return submitRetrier.submit(() -> submitOnce(taskType, payload, maxAttempts, idempotencyKey));
     }
 
     /** One submission exchange over the wire; synchronized like every other request. */
-    private synchronized String submitOnce(TaskType taskType, JsonNode payload, int maxAttempts)
-            throws IOException {
-        Message reply = exchange(new SubmitJob(taskType, payload, maxAttempts));
+    private synchronized String submitOnce(TaskType taskType, JsonNode payload, int maxAttempts,
+                                           String idempotencyKey) throws IOException {
+        Message reply = exchange(new SubmitJob(taskType, payload, maxAttempts, idempotencyKey));
         if (reply instanceof JobSubmitted submitted) {
             return submitted.jobId();
         }
