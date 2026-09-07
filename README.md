@@ -187,6 +187,10 @@ admission check stays cheap even under heavy load. Overload semantics:
   since-lowered limit**; the recovered jobs run to completion normally, and only
   *new* submissions are rejected until the count falls back below the limit.
 
+The client **surfaces** a rejection by default (one-shot submit). It can also
+**opt in** to bounded, jittered retry of *retryable* rejections — see
+[client-side submission retry](#client-side-submission-retry) below.
+
 Watch it shed load with no workers running (jobs stay `QUEUED`, so they stay
 active):
 
@@ -194,6 +198,31 @@ active):
 ./scripts/coordinator.sh --max-active-jobs 3
 ./scripts/client.sh submit sleep --milliseconds 60000   # x4; the 4th is rejected
 ```
+
+**Client-side submission retry.** By default the client makes exactly one
+submission attempt and surfaces a `SUBMIT_REJECTED` to the caller (unchanged
+behavior). Passing `--submit-retries N` lets it re-attempt admission up to `N`
+times **after** the first attempt (so `N + 1` attempts total; `N = 0` is the
+default one-shot):
+
+```bash
+./scripts/client.sh submit sha256 --text abc --submit-retries 4
+# tune the back-off: --submit-retry-base-millis 200 --submit-retry-max-millis 5000
+```
+
+- It retries **only** a typed `SUBMIT_REJECTED` whose `retryable` flag is true.
+  A malformed-request error, a protocol violation, or any transport failure is
+  **never** retried — a dropped connection is ambiguous about whether the job
+  was created, so a blind resend could submit it twice. Retrying a *rejection*
+  is safe because a rejection provably creates and persists nothing.
+- Back-off is bounded exponential with **full jitter**
+  (`random in [0, min(cap, base·2^(n-1))]`), so many clients rejected at once do
+  not retry in lockstep. When the budget is exhausted the caller still receives
+  the typed `SubmitRejectedException`.
+- This is purely a **client** convenience; the wire protocol and coordinator are
+  unchanged, and it is distinct from the coordinator's *execution* retries.
+- The **benchmark deliberately does not retry** — it measures raw admission
+  shedding, so its accepted/rejected counts stay directly comparable.
 
 **Measured overload behavior** (Apple M1 Pro, 3 workers × capacity 4 = 12 slots,
 240× 500 ms sleep jobs from 8 connections; full methodology in the doc):
@@ -325,7 +354,9 @@ containers.
   coordinator refuses new submissions with a typed, retryable `SUBMIT_REJECTED`
   rather than queueing them. This bounds the coordinator's memory and the
   latency of admitted work; it does *not* raise throughput, and it applies only
-  to new work — jobs already in the system always run to a terminal state.
+  to new work — jobs already in the system always run to a terminal state. The
+  client can opt in to bounded, jittered retry of these rejections
+  (`--submit-retries`), which never resends on an ambiguous transport failure.
 - **Single coordinator.** The coordinator is a single point of failure;
   durability (not availability) is what restart recovery provides. Multiple
   coordinators would require leader election/consensus — out of scope, by
@@ -342,8 +373,11 @@ More detail in [docs/FAILURE_MODEL.md](docs/FAILURE_MODEL.md) and
 - Scheduling is FIFO / least-loaded; no priorities, deadlines, or fairness.
 - Results live in the job row; large results would need external storage.
 - Admission is a single global active-job limit (`--max-active-jobs`); there is
-  no per-client fairness or priority in what gets shed, and the client does not
-  yet auto-retry rejections (it surfaces them for the caller to handle).
+  no per-client fairness or priority in what gets shed. The client surfaces
+  rejections by default and can opt in to bounded, jittered retry
+  (`--submit-retries`), but this only reschedules the client's own attempts — it
+  adds no capacity and, under sustained overload, only shifts where the load is
+  shed.
 - Cancellation is cooperative (thread interruption), not hard preemption: a
   task that ignores interruption keeps running until it finishes, though its
   lease is already revoked so its result is discarded.

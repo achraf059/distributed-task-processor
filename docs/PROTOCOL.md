@@ -75,6 +75,14 @@ coordinator is overloaded — back off and retry". `retryable` is always `true`;
 are gated this way; retries of already-accepted jobs never pass through
 admission control.
 
+Acting on `retryable` is a **client-side** concern, not part of the wire
+contract: the reference client honors the flag (it only retries when the server
+sets it) and can optionally back off and re-submit on the caller's behalf
+(`--submit-retries`, off by default; see the README and design decision 15). The
+protocol itself is unchanged — the coordinator sends one reply per request and
+has no notion of client retry. A client must never treat an ambiguous transport
+or protocol failure as retryable, since a job may already have been created.
+
 A job snapshot contains: `jobId`, `taskType`, `state` (one of QUEUED, RUNNING,
 RETRY_WAIT, COMPLETED, FAILED, CANCELLED), `attempts`, `maxAttempts`,
 `workerId` (only while RUNNING), `result`, `error` (last attempt's error, kept

@@ -207,3 +207,46 @@ What this explicitly does **not** buy: it is not fairness (a single global limit
 with no per-client quota or priority in what gets shed) and it does not raise
 throughput (the service rate is still the workers' slot ceiling) — the point is
 *defined* overload behavior, not a faster system.
+
+## 15. Optional client-side submission retry (opt-in, jittered, rejection-only)
+
+Decision 14 gives the client a typed, retryable `SUBMIT_REJECTED` and leaves the
+back-off decision to the caller. This adds an *optional* client policy that
+performs that back-off, without changing the default behavior or the wire.
+
+- **Off by default; a client policy, not a protocol change.** With no flag the
+  client makes exactly one attempt and surfaces the rejection, exactly as
+  before. `--submit-retries N` enables up to `N` retries *after* the first
+  attempt (`N + 1` total). The coordinator, the protocol, and the benchmark are
+  untouched — this lives entirely in `CoordinatorClient` and a small
+  `ClientRetryPolicy` / `SubmitRetrier` pair.
+- **Retry the rejection, never an ambiguous failure.** The loop retries *only* a
+  `SubmitRejectedException` whose wire `retryable` flag is true. A malformed
+  request, a protocol violation, or any transport `IOException` is propagated on
+  first sight. The reason is correctness, not caution: a rejection provably
+  creates and persists nothing (asserted by the admission-control tests), so
+  resending is safe; a connection that dropped *after* the coordinator accepted
+  the job is ambiguous, and a blind resend would risk a duplicate submission.
+  This is why the exception now reads the `retryable` field off the wire instead
+  of assuming it — the client only retries when the server actually said it was
+  safe.
+- **This is not the coordinator's execution retry.** Decision 5's retries re-run
+  a job that was *accepted* and whose attempt failed; those never re-enter
+  admission control. This retries *admission itself* for a job that was never
+  accepted. Keeping them in separate classes (`RetryPolicy` on the coordinator,
+  `ClientRetryPolicy` on the client) keeps the two from being conflated.
+- **Full jitter, bounded.** Back-off is `random in [0, min(cap, base·2^(n-1))]`.
+  Full jitter (rather than a fixed exponential schedule) desynchronizes clients
+  that were all rejected in the same overload spike, so they do not retry in
+  lockstep and re-create it. A hard attempt cap bounds the worst-case wait to
+  `(maxAttempts − 1) · cap`. Honestly, retry adds no capacity — under sustained
+  overload it only shifts where load is shed; jitter and the cap keep it from
+  amplifying the overload.
+- **Back-off holds no lock.** The client synchronizes each wire exchange so one
+  connection serves one request at a time, but the retry loop sleeps *outside*
+  that critical section, so a back-off never blocks another thread's exchange on
+  the same client. Sleep is injectable, so the retry decision and delay bounds
+  are unit-tested deterministically with no real waiting.
+- **Benchmark stays one-shot.** The load generator deliberately does not retry,
+  so its accepted/rejected counts keep measuring raw admission shedding and stay
+  comparable across runs.
