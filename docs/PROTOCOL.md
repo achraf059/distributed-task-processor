@@ -58,7 +58,7 @@ connection.
 
 | Request | Reply | Notes |
 |---|---|---|
-| `SUBMIT_JOB` (`taskType`, `payload`, `maxAttempts`) | `JOB_SUBMITTED` (`jobId`) or `SUBMIT_REJECTED` | `maxAttempts ≤ 0` → server default; payload validated before the job exists; rejected if the coordinator is at its active-job limit (see below) |
+| `SUBMIT_JOB` (`taskType`, `payload`, `maxAttempts`, optional `idempotencyKey`) | `JOB_SUBMITTED` (`jobId`) or `SUBMIT_REJECTED` or `ERROR` | `maxAttempts ≤ 0` → server default; payload validated before the job exists; rejected if the coordinator is at its active-job limit (see below); optional `idempotencyKey` deduplicates submissions (see below) |
 | `GET_JOB_STATUS` (`jobId`) | `JOB_STATUS` (job snapshot) | unknown id → `ERROR` |
 | `LIST_JOBS` | `JOB_LIST` (snapshots, newest first) | |
 | `LIST_WORKERS` | `WORKER_LIST` (live workers) | |
@@ -82,6 +82,30 @@ sets it) and can optionally back off and re-submit on the caller's behalf
 protocol itself is unchanged — the coordinator sends one reply per request and
 has no notion of client retry. A client must never treat an ambiguous transport
 or protocol failure as retryable, since a job may already have been created.
+
+**`idempotencyKey`** (optional, nullable) on `SUBMIT_JOB` requests durable
+submission deduplication. When present, the coordinator remembers the mapping
+`key → jobId` (persisted on the job row, so it survives restart). Behavior:
+
+- **First time seen:** a normal new job is created and the key recorded; reply
+  is `JOB_SUBMITTED (jobId)`.
+- **Seen again, same logical request** (identical `taskType`, `payload`, and
+  effective `maxAttempts`): the coordinator returns the **original** `jobId` in a
+  `JOB_SUBMITTED` — indistinguishable from the first success, and it creates no
+  new job. This holds even after the job has completed, failed, or been
+  cancelled: the key stays bound to that one job and never triggers a re-run.
+- **Seen again, different request** (key reused with a different task type,
+  payload, or max attempts): `ERROR` — the existing job is left untouched. This
+  milestone deliberately reuses `ERROR` rather than adding a new response type.
+- A known-key duplicate is resolved **before** admission control, so it is
+  returned even when the coordinator is at `--max-active-jobs` (it adds no active
+  job). A genuinely new key is normal new work and is admission-controlled.
+
+Omitting the field (older clients, or callers that don't want dedup) preserves
+the historical behavior exactly: every submission creates a fresh job. The field
+decodes to `null` when absent, so it is backward-compatible in both directions.
+Deduplication concerns **submission identity only** — it does not change
+execution semantics, which remain at-least-once.
 
 A job snapshot contains: `jobId`, `taskType`, `state` (one of QUEUED, RUNNING,
 RETRY_WAIT, COMPLETED, FAILED, CANCELLED), `attempts`, `maxAttempts`,

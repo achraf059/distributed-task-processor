@@ -122,9 +122,10 @@ public final class ClientMain {
         };
 
         int submitRetries = options.getInt("submit-retries", 0);
+        String idempotencyKey = options.get("idempotency-key", null);
         String jobId;
         try {
-            jobId = client.submit(taskType, payload, options.getInt("max-attempts", 0));
+            jobId = client.submit(taskType, payload, options.getInt("max-attempts", 0), idempotencyKey);
         } catch (SubmitRejectedException rejected) {
             System.err.println("Submission rejected (coordinator overloaded): " + rejected.getMessage());
             System.err.println("  Active jobs: " + rejected.activeCount()
@@ -293,7 +294,9 @@ public final class ClientMain {
                   --submit-retries <n>            retries after the first attempt on a
                                                   retryable overload rejection (default 0 = off)
                   --submit-retry-base-millis <ms> base back-off (default 200)
-                  --submit-retry-max-millis <ms>  back-off cap (default 5000)""");
+                  --submit-retry-max-millis <ms>  back-off cap (default 5000)
+                  --idempotency-key <key>         dedup key: resubmitting the same key returns
+                                                  the original job instead of creating a new one""");
     }
 
     private static final class UsageException extends Exception {

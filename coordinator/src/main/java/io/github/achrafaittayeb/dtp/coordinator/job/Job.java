@@ -23,6 +23,7 @@ public final class Job {
     private final int maxAttempts;
     private final long executionTimeoutMillis;
     private final long createdAtMillis;
+    private final String idempotencyKey;
 
     private JobState state;
     private int attempts;
@@ -34,10 +35,17 @@ public final class Job {
     private String error;
     private long updatedAtMillis;
 
+    /** Creates a new QUEUED job with no idempotency key. */
     public static Job createQueued(TaskType taskType, JsonNode payload, int maxAttempts,
                                    long executionTimeoutMillis, long now) {
+        return createQueued(taskType, payload, maxAttempts, executionTimeoutMillis, now, null);
+    }
+
+    public static Job createQueued(TaskType taskType, JsonNode payload, int maxAttempts,
+                                   long executionTimeoutMillis, long now, String idempotencyKey) {
         return new Job(UUID.randomUUID().toString(), taskType, payload, maxAttempts,
-                executionTimeoutMillis, JobState.QUEUED, 0, null, null, 0, 0, null, null, now, now);
+                executionTimeoutMillis, JobState.QUEUED, 0, null, null, 0, 0, null, null, now, now,
+                idempotencyKey);
     }
 
     /** Full-field constructor used when rehydrating from persistent storage. */
@@ -45,7 +53,7 @@ public final class Job {
                long executionTimeoutMillis, JobState state, int attempts,
                String currentAttemptId, String assignedWorkerId,
                long deadlineMillis, long nextEligibleTimeMillis, String result, String error,
-               long createdAtMillis, long updatedAtMillis) {
+               long createdAtMillis, long updatedAtMillis, String idempotencyKey) {
         this.id = id;
         this.taskType = taskType;
         this.payload = payload;
@@ -61,6 +69,7 @@ public final class Job {
         this.error = error;
         this.createdAtMillis = createdAtMillis;
         this.updatedAtMillis = updatedAtMillis;
+        this.idempotencyKey = idempotencyKey;
     }
 
     /**
@@ -175,6 +184,11 @@ public final class Job {
 
     public String id() {
         return id;
+    }
+
+    /** Client-supplied submission-deduplication key, or {@code null} if none was provided. */
+    public String idempotencyKey() {
+        return idempotencyKey;
     }
 
     public TaskType taskType() {

@@ -92,6 +92,43 @@ class SqliteJobRepositoryTest {
             assertThat(loaded.result()).isEqualTo("old-result");
             assertThat(loaded.executionTimeoutMillis()).isEqualTo(600_000L); // migration default
             assertThat(loaded.deadlineMillis()).isZero();
+            assertThat(loaded.idempotencyKey()).isNull(); // migrated column defaults to NULL
+
+            // The migrated database is fully usable: a new keyed job saves and loads.
+            Job keyed = Job.createQueued(TaskType.SHA256,
+                    JsonNodeFactory.instance.objectNode().put("text", "x"), 3, 5_000L, 30L, "key-1");
+            migrated.save(keyed);
+            assertThat(migrated.loadAll())
+                    .filteredOn(j -> "key-1".equals(j.idempotencyKey()))
+                    .singleElement()
+                    .satisfies(j -> assertThat(j.id()).isEqualTo(keyed.id()));
+        }
+    }
+
+    @Test
+    void persistsAndReloadsIdempotencyKey() {
+        Job keyed = Job.createQueued(TaskType.WORD_COUNT,
+                JsonNodeFactory.instance.objectNode().put("text", "a b"), 3, 5_000L, 42L, "submit-key-7");
+
+        try (SqliteJobRepository repository = new SqliteJobRepository(dbPath())) {
+            repository.save(keyed);
+        }
+        try (SqliteJobRepository reopened = new SqliteJobRepository(dbPath())) {
+            Job loaded = reopened.loadAll().getFirst();
+            assertThat(loaded.idempotencyKey()).isEqualTo("submit-key-7");
+        }
+    }
+
+    @Test
+    void reSavingAKeyedJobKeepsItsKeyImmutable() {
+        try (SqliteJobRepository repository = new SqliteJobRepository(dbPath())) {
+            Job keyed = Job.createQueued(TaskType.SLEEP,
+                    JsonNodeFactory.instance.objectNode().put("durationMillis", 10), 1, 5_000L, 1L, "k");
+            repository.save(keyed);
+            keyed.assignTo("w", 2L); // a later state change re-saves the row
+            repository.save(keyed);
+
+            assertThat(repository.loadAll().getFirst().idempotencyKey()).isEqualTo("k");
         }
     }
 

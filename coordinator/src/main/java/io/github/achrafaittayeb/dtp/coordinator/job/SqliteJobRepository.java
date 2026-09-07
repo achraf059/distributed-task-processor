@@ -32,12 +32,15 @@ public final class SqliteJobRepository implements JobRepository {
 
     private static final Logger log = LoggerFactory.getLogger(SqliteJobRepository.class);
 
+    // idempotency_key is only ever set on INSERT (it is immutable identity for the
+    // logical submission); the ON CONFLICT UPDATE path deliberately leaves it alone
+    // so re-saving a job on each state change never rewrites its key.
     private static final String UPSERT = """
             INSERT INTO jobs (id, task_type, payload, max_attempts, execution_timeout,
                               state, attempts, current_attempt_id, assigned_worker_id,
                               deadline, next_eligible_time, result, error,
-                              created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              created_at, updated_at, idempotency_key)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 state = excluded.state,
                 attempts = excluded.attempts,
@@ -84,13 +87,25 @@ public final class SqliteJobRepository implements JobRepository {
                         result TEXT,
                         error TEXT,
                         created_at INTEGER NOT NULL,
-                        updated_at INTEGER NOT NULL
+                        updated_at INTEGER NOT NULL,
+                        idempotency_key TEXT
                     )""");
         }
         // Databases created before execution deadlines existed lack these two
         // columns; add them in place so old job history remains loadable.
         ensureColumn("execution_timeout", "INTEGER NOT NULL DEFAULT 600000");
         ensureColumn("deadline", "INTEGER NOT NULL DEFAULT 0");
+        // Databases created before idempotent submission lack this column; it is
+        // nullable, so existing rows migrate to a NULL (un-keyed) key.
+        ensureColumn("idempotency_key", "TEXT");
+        // Durable backstop for deduplication: two different jobs can never share a
+        // non-null key. The partial predicate lets any number of NULL (un-keyed)
+        // jobs coexist. The in-core check is the primary guard; this catches bugs.
+        try (Statement statement = connection.createStatement()) {
+            statement.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency_key
+                        ON jobs(idempotency_key) WHERE idempotency_key IS NOT NULL""");
+        }
     }
 
     private void ensureColumn(String column, String definition) throws SQLException {
@@ -126,6 +141,7 @@ public final class SqliteJobRepository implements JobRepository {
             statement.setString(13, job.error());
             statement.setLong(14, job.createdAtMillis());
             statement.setLong(15, job.updatedAtMillis());
+            statement.setString(16, job.idempotencyKey());
             statement.executeUpdate();
         } catch (SQLException | JsonProcessingException e) {
             // Losing durability silently would break recovery guarantees; fail loudly.
@@ -164,7 +180,8 @@ public final class SqliteJobRepository implements JobRepository {
                 row.getString("result"),
                 row.getString("error"),
                 row.getLong("created_at"),
-                row.getLong("updated_at"));
+                row.getLong("updated_at"),
+                row.getString("idempotency_key"));
     }
 
     @Override
