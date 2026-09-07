@@ -250,3 +250,53 @@ performs that back-off, without changing the default behavior or the wire.
 - **Benchmark stays one-shot.** The load generator deliberately does not retry,
   so its accepted/rejected counts keep measuring raw admission shedding and stay
   comparable across runs.
+
+## 16. Durable idempotent submission (optional client key, dedup before admission)
+
+Decision 15 stops short of retrying *transport* failures because a resend after
+an ambiguous drop could create a duplicate job — the coordinator may have
+accepted and persisted the job before the connection broke. This decision adds
+the missing primitive: an optional, client-supplied idempotency key that makes a
+resend return the *same* logical job instead of a new one.
+
+- **Client-generated, optional, off by default.** The key is the client's, not
+  the coordinator's: only the client can reconstruct the identical request after
+  a lost response, so a coordinator-generated key would defeat the purpose. It is
+  a nullable field on `SUBMIT_JOB`; omitting it preserves today's behavior
+  exactly (every submission is a fresh job). Jackson decodes a missing field to
+  `null`, so old and new peers interoperate without a protocol version bump.
+- **Dedup before admission.** A known key is resolved before the active-job
+  check and so bypasses `--max-active-jobs`: it creates no new job, so there is
+  nothing to admit — the same reasoning by which execution retries never
+  re-enter admission (decision 14). This does **not** weaken admission: a
+  genuinely new key is new work and is gated normally. A rejected submission
+  persists nothing (including no key), so a later resend of that key is correctly
+  treated as fresh.
+- **Race-free by construction.** The `key → jobId` map is core-thread-confined
+  like all other state, so check-then-create is atomic without locks: the first
+  of N concurrent duplicates creates the job and the rest dedup to it. A partial
+  unique index on the SQLite column (`WHERE idempotency_key IS NOT NULL`) is a
+  durable backstop, not the primary guard.
+- **A key stays bound for the job's whole life, including terminal.** Resubmitting
+  a completed/failed/cancelled key returns that same terminal job rather than
+  re-running it. This is the honest semantics — a key identifies a *submission*,
+  not a fresh execution. The corollary is a footgun: a key is "burned" once its
+  job is terminal; to run again, use a new key.
+- **Conflict is an error, not a silent replacement.** Reusing a key with a
+  different task type, payload, or effective max attempts returns `ERROR` and
+  leaves the existing job untouched, so a retry that accidentally mutated the
+  request is caught rather than mapped to the wrong job. This milestone reuses
+  `ERROR` deliberately rather than growing the protocol with a new type.
+- **Persistence rides the existing job row.** The key is one nullable column
+  added with the same in-place `ensureColumn` migration used for the deadline
+  columns; recovery rebuilds the in-memory map from the loaded rows. No new
+  table and no new config flag — the feature is inert unless a key is supplied.
+- **What it does and does not buy.** It makes duplicate *logical submission*
+  preventable, which is the precondition for safely auto-retrying transport
+  failures — but that retry is intentionally **not** enabled here (it is a
+  separate, opt-in follow-up). It does **not** provide exactly-once *execution*:
+  a single logical job can still run more than once under worker failure. And
+  because the system has no client authentication, keys share one global
+  namespace — two clients choosing the same string collide. Proper per-client
+  isolation needs identity the system deliberately does not yet have; until then,
+  callers should use unguessable, namespaced keys (e.g. UUIDs).

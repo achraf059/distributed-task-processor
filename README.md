@@ -224,6 +224,32 @@ default one-shot):
 - The **benchmark deliberately does not retry** — it measures raw admission
   shedding, so its accepted/rejected counts stay directly comparable.
 
+**Durable idempotent submission.** A client may attach a stable
+`--idempotency-key` to a submission. The coordinator remembers `key → jobId`
+(persisted on the job row, so it survives restart), and a later submission with
+the same key returns the **original** job id instead of creating another job:
+
+```bash
+./scripts/client.sh submit sha256 --text abc --idempotency-key order-42
+./scripts/client.sh submit sha256 --text abc --idempotency-key order-42  # same job id, no new job
+```
+
+- The key is **optional**; omitting it is exactly today's behavior (every
+  submission is a fresh job). It is checked **before** admission control, so a
+  known key returns its job even at `--max-active-jobs` (it adds no active job);
+  a genuinely new key is admission-controlled as normal.
+- The mapping holds for the job's whole life, **including terminal states** — a
+  completed, failed, or cancelled key returns that same job and never re-runs it.
+  A key is therefore "burned" once its job is terminal; use a new key to run
+  again.
+- Reusing a key with a **different** task type, payload, or max attempts is a
+  conflict (`ERROR`); the existing job is left untouched.
+- This deduplicates **submission**, not execution — execution stays
+  at-least-once. It is the precondition for safely auto-retrying transport
+  failures, but that retry is intentionally **not** enabled in this milestone.
+  Because there is no client authentication, keys share one global namespace —
+  use unguessable, namespaced keys (e.g. UUIDs).
+
 **Measured overload behavior** (Apple M1 Pro, 3 workers × capacity 4 = 12 slots,
 240× 500 ms sleep jobs from 8 connections; full methodology in the doc):
 
@@ -381,6 +407,12 @@ More detail in [docs/FAILURE_MODEL.md](docs/FAILURE_MODEL.md) and
 - Cancellation is cooperative (thread interruption), not hard preemption: a
   task that ignores interruption keeps running until it finishes, though its
   lease is already revoked so its result is discarded.
+- Idempotent submission (`--idempotency-key`) deduplicates *submissions*, not
+  execution — execution remains at-least-once. Keys share one global namespace
+  (there is no client authentication to scope them), and a key is bound to its
+  job for the job's whole life, so a terminal key cannot be reused to run again.
+  Automatic retry of ambiguous transport failures is not yet enabled; the key is
+  the groundwork that would make it safe.
 
 ## Documentation
 
