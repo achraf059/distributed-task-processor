@@ -99,4 +99,32 @@ class MessageSerializationTest {
                 StandardCharsets.UTF_8);
         assertThat(json).contains("\"type\":\"SUBMIT_REJECTED\"");
     }
+
+    @Test
+    void roundTripsSubmitJobWithAndWithoutIdempotencyKey() throws IOException {
+        ObjectNode payload = JsonNodeFactory.instance.objectNode().put("text", "abc");
+
+        SubmitJob withKey = new SubmitJob(TaskType.SHA256, payload, 2, "key-123");
+        SubmitJob decodedWithKey = (SubmitJob) roundTrip(withKey);
+        assertThat(decodedWithKey).isEqualTo(withKey);
+        assertThat(decodedWithKey.idempotencyKey()).isEqualTo("key-123");
+
+        SubmitJob noKey = new SubmitJob(TaskType.SHA256, payload, 2);
+        SubmitJob decodedNoKey = (SubmitJob) roundTrip(noKey);
+        assertThat(decodedNoKey).isEqualTo(noKey);
+        assertThat(decodedNoKey.idempotencyKey()).isNull();
+    }
+
+    @Test
+    void decodesLegacySubmitJobWithoutIdempotencyKeyField() throws IOException {
+        // A frame from an older client that predates the field must still decode,
+        // with the key defaulting to null.
+        byte[] legacy = ("{\"type\":\"SUBMIT_JOB\",\"taskType\":\"SHA256\","
+                + "\"payload\":{\"text\":\"abc\"},\"maxAttempts\":0}")
+                .getBytes(StandardCharsets.UTF_8);
+        SubmitJob decoded = (SubmitJob) MessageIO.decode(legacy);
+        assertThat(decoded.taskType()).isEqualTo(TaskType.SHA256);
+        assertThat(decoded.maxAttempts()).isZero();
+        assertThat(decoded.idempotencyKey()).isNull();
+    }
 }
