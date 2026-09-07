@@ -37,24 +37,54 @@ public final class CoordinatorClient implements AutoCloseable {
     private final Socket socket;
     private final InputStream in;
     private final OutputStream out;
+    private final SubmitRetrier submitRetrier;
 
     public CoordinatorClient(String host, int port) throws IOException {
+        this(host, port, ClientRetryPolicy.none());
+    }
+
+    /**
+     * Connects with an explicit submission-retry policy. {@link ClientRetryPolicy#none()}
+     * (the default of the two-arg constructor) preserves the historical
+     * one-shot behavior; any other policy re-attempts admission after a
+     * retryable overload rejection.
+     */
+    public CoordinatorClient(String host, int port, ClientRetryPolicy retryPolicy)
+            throws IOException {
+        this(host, port, new SubmitRetrier(retryPolicy));
+    }
+
+    /** Test seam: inject a retrier with a fake sleeper/RNG for deterministic timing. */
+    CoordinatorClient(String host, int port, SubmitRetrier submitRetrier) throws IOException {
         this.socket = new Socket(host, port);
         this.socket.setTcpNoDelay(true);
         this.in = socket.getInputStream();
         this.out = socket.getOutputStream();
+        this.submitRetrier = submitRetrier;
     }
 
     /**
      * Submits a job; returns its id. {@code maxAttempts <= 0} uses the server
-     * default.
+     * default. When configured with a retrying {@link ClientRetryPolicy}, a
+     * retryable overload rejection is re-attempted with jittered back-off; the
+     * back-off sleep happens outside this instance's synchronization, so it
+     * never blocks another thread's wire exchange on the same connection. (A
+     * connection still serves one request at a time, so concurrent callers on
+     * one client are not expected; the point is that sleeping holds no monitor.)
      *
-     * @throws SubmitRejectedException if the coordinator is at its active-job
-     *     limit (a valid request refused under overload — distinct from a
-     *     malformed-request error, and safe to retry after a back-off)
-     * @throws IOException on any other error reply or transport failure
+     * @throws SubmitRejectedException if the coordinator refused the submission
+     *     under overload and the retry budget (if any) was exhausted — a valid
+     *     request refused, distinct from a malformed-request error
+     * @throws IOException on any other error reply or transport failure (never
+     *     retried, since a job may already exist)
      */
-    public synchronized String submit(TaskType taskType, JsonNode payload, int maxAttempts)
+    public String submit(TaskType taskType, JsonNode payload, int maxAttempts)
+            throws IOException {
+        return submitRetrier.submit(() -> submitOnce(taskType, payload, maxAttempts));
+    }
+
+    /** One submission exchange over the wire; synchronized like every other request. */
+    private synchronized String submitOnce(TaskType taskType, JsonNode payload, int maxAttempts)
             throws IOException {
         Message reply = exchange(new SubmitJob(taskType, payload, maxAttempts));
         if (reply instanceof JobSubmitted submitted) {
