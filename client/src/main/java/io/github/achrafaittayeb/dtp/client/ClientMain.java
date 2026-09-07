@@ -73,7 +73,7 @@ public final class ClientMain {
             return;
         }
 
-        try (CoordinatorClient client = new CoordinatorClient(host, port)) {
+        try (CoordinatorClient client = new CoordinatorClient(host, port, submitRetryPolicy(options))) {
             switch (command) {
                 case "submit" -> submit(client, positionals, options);
                 case "status" -> printJob(client.status(requireJobId(positionals)));
@@ -121,6 +121,7 @@ public final class ClientMain {
             default -> throw new UsageException("Unknown task type: " + positionals.getFirst());
         };
 
+        int submitRetries = options.getInt("submit-retries", 0);
         String jobId;
         try {
             jobId = client.submit(taskType, payload, options.getInt("max-attempts", 0));
@@ -128,7 +129,13 @@ public final class ClientMain {
             System.err.println("Submission rejected (coordinator overloaded): " + rejected.getMessage());
             System.err.println("  Active jobs: " + rejected.activeCount()
                     + " (limit " + rejected.limit() + ")");
-            System.err.println("  Retryable: back off and submit again once load subsides.");
+            if (submitRetries > 0) {
+                System.err.println("  Still overloaded after " + submitRetries
+                        + " retr" + (submitRetries == 1 ? "y" : "ies") + "; giving up.");
+            } else {
+                System.err.println("  Retryable: back off and submit again once load subsides"
+                        + " (or pass --submit-retries N).");
+            }
             System.exit(3);
             return;
         }
@@ -219,6 +226,29 @@ public final class ClientMain {
         }
     }
 
+    /**
+     * Builds the submission-retry policy from opt-in flags. Absent (or
+     * {@code --submit-retries 0}) means no retry — the historical one-shot
+     * behavior. {@code --submit-retries N} allows N retries <em>after</em> the
+     * first attempt (N+1 attempts total), with jittered exponential back-off.
+     */
+    private static ClientRetryPolicy submitRetryPolicy(Args options) throws UsageException {
+        int retries = options.getInt("submit-retries", 0);
+        if (retries < 0) {
+            throw new UsageException("--submit-retries must be >= 0");
+        }
+        if (retries == 0) {
+            return ClientRetryPolicy.none();
+        }
+        long base = options.getLong("submit-retry-base-millis", 200);
+        long max = options.getLong("submit-retry-max-millis", 5_000);
+        try {
+            return ClientRetryPolicy.ofRetries(retries, base, max);
+        } catch (IllegalArgumentException invalid) {
+            throw new UsageException(invalid.getMessage());
+        }
+    }
+
     private static String requireJobId(List<String> positionals) throws UsageException {
         if (positionals.isEmpty()) {
             throw new UsageException("Missing job id");
@@ -259,7 +289,11 @@ public final class ClientMain {
                         [--task sha256|sleep|prime-count] [--sleep-millis <ms>]
                         [--prime-limit <n>] [--wait-timeout-millis <ms>]
                 Global options: --host <host> (default localhost), --port <port> (default 7071)
-                Submit options: --max-attempts <n> (default: coordinator setting)""");
+                Submit options: --max-attempts <n> (default: coordinator setting)
+                  --submit-retries <n>            retries after the first attempt on a
+                                                  retryable overload rejection (default 0 = off)
+                  --submit-retry-base-millis <ms> base back-off (default 200)
+                  --submit-retry-max-millis <ms>  back-off cap (default 5000)""");
     }
 
     private static final class UsageException extends Exception {
