@@ -56,6 +56,18 @@ public final class CoordinatorCore implements AutoCloseable {
     private final RetryPolicy retryPolicy;
     private final WorkerRegistry registry = new WorkerRegistry();
     private final Map<String, Job> jobs = new HashMap<>();
+
+    /**
+     * Maps a client-supplied idempotency key to the id of the one logical job it
+     * created, so a resubmission of the same key returns the original job rather
+     * than creating a duplicate. Confined to the core thread like {@link #jobs},
+     * so the check-then-create is atomic without locking. Rebuilt from persisted
+     * job rows on recovery, so deduplication survives a restart. A job keeps its
+     * entry for its whole lifetime, including terminal states — resubmitting a
+     * completed/failed/cancelled key returns that same terminal job.
+     */
+    private final Map<String, String> jobIdByKey = new HashMap<>();
+
     private final ScheduledExecutorService coreThread;
 
     /**
@@ -131,31 +143,84 @@ public final class CoordinatorCore implements AutoCloseable {
     // Requests from client connections (block until the core thread answers)
     // ------------------------------------------------------------------
 
-    /** Outcome of a submission: either accepted (with a job id) or rejected because the coordinator is at its active-job limit. */
-    public record SubmitOutcome(boolean accepted, String jobId, int activeCount, int limit) {
+    /**
+     * Outcome of a submission. {@code ACCEPTED} carries the job id (a fresh job,
+     * or the original job for an idempotent duplicate); {@code REJECTED} means
+     * the coordinator is at its active-job limit; {@code CONFLICT} means the
+     * idempotency key is already bound to a materially different submission and
+     * {@code conflictMessage} explains why (surfaced to the client as an error).
+     */
+    public record SubmitOutcome(Status status, String jobId, int activeCount, int limit,
+                                String conflictMessage) {
+
+        public enum Status { ACCEPTED, REJECTED, CONFLICT }
 
         static SubmitOutcome accepted(String jobId, int activeCount, int limit) {
-            return new SubmitOutcome(true, jobId, activeCount, limit);
+            return new SubmitOutcome(Status.ACCEPTED, jobId, activeCount, limit, null);
         }
 
         static SubmitOutcome rejected(int activeCount, int limit) {
-            return new SubmitOutcome(false, null, activeCount, limit);
+            return new SubmitOutcome(Status.REJECTED, null, activeCount, limit, null);
         }
+
+        static SubmitOutcome conflict(String message) {
+            return new SubmitOutcome(Status.CONFLICT, null, 0, 0, message);
+        }
+
+        public boolean accepted() {
+            return status == Status.ACCEPTED;
+        }
+    }
+
+    /** Overload {@link #submitJob(TaskType, JsonNode, int, String)} without an idempotency key. */
+    public SubmitOutcome submitJob(TaskType taskType, JsonNode payload, int requestedMaxAttempts)
+            throws InvalidPayloadException {
+        return submitJob(taskType, payload, requestedMaxAttempts, null);
     }
 
     /**
      * Admission point for new work. A malformed payload is rejected up front
-     * (before the core thread) as {@link InvalidPayloadException}. A well-formed
-     * request is admitted only if the active-job count is below the configured
-     * limit; otherwise it is shed with a {@link SubmitOutcome#rejected} outcome —
-     * the coordinator refuses new work rather than buffering it unboundedly.
-     * Only fresh submissions pass through here; retries never do.
+     * (before the core thread) as {@link InvalidPayloadException}. On the core
+     * thread the request is handled in this order:
+     *
+     * <ol>
+     *   <li><b>Deduplication first.</b> If a non-null {@code idempotencyKey} is
+     *       already known, the original job's id is returned. This happens
+     *       <em>before</em> admission control and so bypasses the active-job
+     *       limit: a known key creates no new job, so there is nothing to admit —
+     *       exactly like a retry of already-accepted work. If the key is known
+     *       but the request differs materially (task type, payload, or effective
+     *       max attempts), it is a {@link SubmitOutcome#conflict}: the existing
+     *       job is left untouched and no new job is created.</li>
+     *   <li><b>Admission.</b> A genuinely new submission (no key, or an unseen
+     *       key) is admitted only if the active-job count is below the limit;
+     *       otherwise it is shed with {@link SubmitOutcome#rejected}.</li>
+     * </ol>
+     *
+     * <p>Deduplication prevents a <em>duplicate logical submission</em>; it does
+     * not change execution semantics, which remain at-least-once. Only fresh
+     * submissions pass through admission; execution retries never do.
      */
-    public SubmitOutcome submitJob(TaskType taskType, JsonNode payload, int requestedMaxAttempts)
-            throws InvalidPayloadException {
+    public SubmitOutcome submitJob(TaskType taskType, JsonNode payload, int requestedMaxAttempts,
+                                   String idempotencyKey) throws InvalidPayloadException {
         TaskPayloads.validate(taskType, payload);
         int maxAttempts = requestedMaxAttempts > 0 ? requestedMaxAttempts : config.defaultMaxAttempts();
         return askCore(() -> {
+            if (idempotencyKey != null) {
+                String existingId = jobIdByKey.get(idempotencyKey);
+                if (existingId != null) {
+                    Job existing = jobs.get(existingId);
+                    if (!matchesSubmission(existing, taskType, payload, maxAttempts)) {
+                        log.warn("Idempotency conflict: key={} bound to jobId={} but resubmission "
+                                + "differs (type/payload/maxAttempts)", idempotencyKey, existingId);
+                        return SubmitOutcome.conflict("Idempotency key '" + idempotencyKey
+                                + "' is already bound to a different submission (job " + existingId + ")");
+                    }
+                    log.info("Idempotent duplicate: key={} returning original jobId={} (state {})",
+                            idempotencyKey, existingId, existing.state());
+                    return SubmitOutcome.accepted(existingId, activeJobCount, config.maxActiveJobs());
+                }
+            }
             int limit = config.maxActiveJobs();
             if (activeJobCount >= limit) {
                 log.warn("Job submission rejected (overloaded): activeJobs={} limit={} type={}",
@@ -163,15 +228,33 @@ public final class CoordinatorCore implements AutoCloseable {
                 return SubmitOutcome.rejected(activeJobCount, limit);
             }
             Job job = Job.createQueued(taskType, payload, maxAttempts,
-                    config.taskTimeoutMillis(), now());
+                    config.taskTimeoutMillis(), now(), idempotencyKey);
             jobs.put(job.id(), job);
+            if (idempotencyKey != null) {
+                jobIdByKey.put(idempotencyKey, job.id());
+            }
             activeJobCount++;
             repository.save(job);
-            log.info("Job submitted: jobId={} type={} maxAttempts={} activeJobs={}/{}",
-                    job.id(), taskType, maxAttempts, activeJobCount, limit);
+            log.info("Job submitted: jobId={} type={} maxAttempts={} activeJobs={}/{} idempotencyKey={}",
+                    job.id(), taskType, maxAttempts, activeJobCount, limit, idempotencyKey);
             scheduleQueuedJobs();
             return SubmitOutcome.accepted(job.id(), activeJobCount, limit);
         });
+    }
+
+    /**
+     * Whether a resubmission under a known key describes the same logical work as
+     * the job the key already created. Payload equality is structural
+     * ({@link JsonNode#equals}), and the stored job holds the already-resolved
+     * effective max attempts, so it is compared against the incoming effective
+     * value.
+     */
+    private boolean matchesSubmission(Job existing, TaskType taskType, JsonNode payload,
+                                      int effectiveMaxAttempts) {
+        return existing != null
+                && existing.taskType() == taskType
+                && existing.maxAttempts() == effectiveMaxAttempts
+                && existing.payload().equals(payload);
     }
 
     /** Observability/test hook: current number of active (non-terminal) jobs, read on the core thread. */
@@ -447,6 +530,12 @@ public final class CoordinatorCore implements AutoCloseable {
                 repository.save(job);
             }
             jobs.put(job.id(), job);
+            // Rebuild the dedup map so idempotent submission survives restart. A
+            // job keeps its key in every state, including terminal, so a resend
+            // of a completed/failed/cancelled key still returns the same job.
+            if (job.idempotencyKey() != null) {
+                jobIdByKey.put(job.idempotencyKey(), job.id());
+            }
             // Seed the active-job counter from each job's post-recovery state, so
             // admission control resumes with an exact count. A restart may leave
             // activeJobCount above a since-lowered limit; that is intended — the

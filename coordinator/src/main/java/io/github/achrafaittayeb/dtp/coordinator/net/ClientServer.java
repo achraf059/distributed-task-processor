@@ -108,10 +108,14 @@ public final class ClientServer implements AutoCloseable {
             return switch (request) {
                 case SubmitJob submit -> {
                     CoordinatorCore.SubmitOutcome outcome = core.submitJob(
-                            submit.taskType(), submit.payload(), submit.maxAttempts());
-                    yield outcome.accepted()
-                            ? new JobSubmitted(outcome.jobId())
-                            : SubmitRejected.overloaded(outcome.activeCount(), outcome.limit());
+                            submit.taskType(), submit.payload(), submit.maxAttempts(),
+                            submit.idempotencyKey());
+                    yield switch (outcome.status()) {
+                        case ACCEPTED -> new JobSubmitted(outcome.jobId());
+                        case REJECTED -> SubmitRejected.overloaded(
+                                outcome.activeCount(), outcome.limit());
+                        case CONFLICT -> new ErrorReply(outcome.conflictMessage());
+                    };
                 }
                 case GetJobStatus status -> core.getJob(status.jobId())
                         .<Message>map(JobStatusReply::new)
