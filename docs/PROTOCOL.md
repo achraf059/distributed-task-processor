@@ -58,7 +58,7 @@ connection.
 
 | Request | Reply | Notes |
 |---|---|---|
-| `SUBMIT_JOB` (`taskType`, `payload`, `maxAttempts`, optional `idempotencyKey`) | `JOB_SUBMITTED` (`jobId`) or `SUBMIT_REJECTED` or `ERROR` | `maxAttempts ≤ 0` → server default; payload validated before the job exists; rejected if the coordinator is at its active-job limit (see below); optional `idempotencyKey` deduplicates submissions (see below) |
+| `SUBMIT_JOB` (`taskType`, `payload`, `maxAttempts`, optional `idempotencyKey`, optional `priority`) | `JOB_SUBMITTED` (`jobId`) or `SUBMIT_REJECTED` or `ERROR` | `maxAttempts ≤ 0` → server default; payload validated before the job exists; rejected if the coordinator is at its active-job limit (see below); optional `idempotencyKey` deduplicates submissions (see below); optional `priority` is `HIGH`/`NORMAL`/`LOW`, default `NORMAL` (see below) |
 | `GET_JOB_STATUS` (`jobId`) | `JOB_STATUS` (job snapshot) | unknown id → `ERROR` |
 | `LIST_JOBS` | `JOB_LIST` (snapshots, newest first) | |
 | `LIST_WORKERS` | `WORKER_LIST` (live workers) | |
@@ -107,10 +107,41 @@ decodes to `null` when absent, so it is backward-compatible in both directions.
 Deduplication concerns **submission identity only** — it does not change
 execution semantics, which remain at-least-once.
 
+**`priority`** (optional, nullable) is the job's base scheduling priority, one
+of `HIGH`, `NORMAL`, or `LOW`. It is carried on the wire as one of those three
+names — never a raw number — so the public contract is stable. An absent field
+decodes to `null` and is treated as `NORMAL`, so omitting priority is
+indistinguishable from sending `NORMAL`; older clients that predate the field
+are unchanged. Scheduling behavior:
+
+- Among `QUEUED` jobs the coordinator assigns the highest **effective** priority
+  first. Effective priority is the base level (`HIGH`=2, `NORMAL`=1, `LOW`=0)
+  raised by one for every whole `--aging-step-millis` (default 60 000) the job
+  has waited since submission, capped at `HIGH`. Age-based promotion prevents
+  low-priority jobs from starving under sustained higher-priority load.
+- Ties at equal effective priority are broken by a coordinator-assigned,
+  persistent, strictly increasing **submission sequence** — true FIFO, even for
+  jobs submitted within the same millisecond.
+- Priority is part of an idempotent submission's identity: reusing an
+  `idempotencyKey` with a *different* priority (where `null`/omitted equals
+  `NORMAL`) is a conflict and returns `ERROR`, exactly like a differing task
+  type, payload, or max attempts.
+- Priority orders queued work only. It does not affect admission control, which
+  worker is chosen, retry budgets, deadlines, cancellation, or stale-result
+  handling, and there is no preemption of running work. A retry keeps the job's
+  original priority and submission sequence.
+
+Priority and submission sequence are persisted, so scheduling order is
+reconstructed after a coordinator restart. Databases created before this
+milestone migrate to `NORMAL` priority and sequence `0` (see the migration note
+in the architecture doc).
+
 A job snapshot contains: `jobId`, `taskType`, `state` (one of QUEUED, RUNNING,
 RETRY_WAIT, COMPLETED, FAILED, CANCELLED), `attempts`, `maxAttempts`,
 `workerId` (only while RUNNING), `result`, `error` (last attempt's error, kept
-for history even after later success), `createdAtMillis`, `updatedAtMillis`.
+for history even after later success), `createdAtMillis`, `updatedAtMillis`,
+and `priority` (base priority; effective/aged priority is intentionally not
+exposed, since it changes with time).
 
 ## Task payloads
 

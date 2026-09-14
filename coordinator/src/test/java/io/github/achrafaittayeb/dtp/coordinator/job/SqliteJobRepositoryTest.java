@@ -2,6 +2,7 @@ package io.github.achrafaittayeb.dtp.coordinator.job;
 
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import io.github.achrafaittayeb.dtp.common.model.JobState;
+import io.github.achrafaittayeb.dtp.common.model.TaskPriority;
 import io.github.achrafaittayeb.dtp.common.model.TaskType;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -93,8 +94,22 @@ class SqliteJobRepositoryTest {
             assertThat(loaded.executionTimeoutMillis()).isEqualTo(600_000L); // migration default
             assertThat(loaded.deadlineMillis()).isZero();
             assertThat(loaded.idempotencyKey()).isNull(); // migrated column defaults to NULL
+            assertThat(loaded.priority()).isEqualTo(TaskPriority.NORMAL); // migrated column default
+            assertThat(loaded.submissionSequence()).isZero(); // legacy rows carry sequence 0
 
-            // The migrated database is fully usable: a new keyed job saves and loads.
+            // Re-saving the migrated legacy job (as a live state change would) must
+            // not corrupt or replace its immutable identity/ordering fields: the
+            // upsert leaves priority, submission_sequence, and idempotency_key alone.
+            migrated.save(loaded);
+            Job reloaded = migrated.loadAll().stream()
+                    .filter(j -> "legacy-job".equals(j.id())).findFirst().orElseThrow();
+            assertThat(reloaded.priority()).isEqualTo(TaskPriority.NORMAL);
+            assertThat(reloaded.submissionSequence()).isZero();
+            assertThat(reloaded.idempotencyKey()).isNull();
+            assertThat(reloaded.result()).isEqualTo("old-result");
+
+            // The migrated database is fully usable and its idempotency unique index
+            // still applies: a new keyed job saves and loads.
             Job keyed = Job.createQueued(TaskType.SHA256,
                     JsonNodeFactory.instance.objectNode().put("text", "x"), 3, 5_000L, 30L, "key-1");
             migrated.save(keyed);
@@ -129,6 +144,38 @@ class SqliteJobRepositoryTest {
             repository.save(keyed);
 
             assertThat(repository.loadAll().getFirst().idempotencyKey()).isEqualTo("k");
+        }
+    }
+
+    @Test
+    void persistsAndReloadsPriorityAndSequence() {
+        Job job = Job.createQueued(TaskType.WORD_COUNT,
+                JsonNodeFactory.instance.objectNode().put("text", "a b"), 3, 5_000L, 42L,
+                null, TaskPriority.HIGH, 77L);
+
+        try (SqliteJobRepository repository = new SqliteJobRepository(dbPath())) {
+            repository.save(job);
+        }
+        try (SqliteJobRepository reopened = new SqliteJobRepository(dbPath())) {
+            Job loaded = reopened.loadAll().getFirst();
+            assertThat(loaded.priority()).isEqualTo(TaskPriority.HIGH);
+            assertThat(loaded.submissionSequence()).isEqualTo(77L);
+        }
+    }
+
+    @Test
+    void reSavingKeepsPriorityAndSequenceImmutable() {
+        try (SqliteJobRepository repository = new SqliteJobRepository(dbPath())) {
+            Job job = Job.createQueued(TaskType.SLEEP,
+                    JsonNodeFactory.instance.objectNode().put("durationMillis", 10), 3, 5_000L, 1L,
+                    null, TaskPriority.LOW, 5L);
+            repository.save(job);
+            job.assignTo("w", 2L); // a later state change re-saves the row
+            repository.save(job);
+
+            Job loaded = repository.loadAll().getFirst();
+            assertThat(loaded.priority()).isEqualTo(TaskPriority.LOW);
+            assertThat(loaded.submissionSequence()).isEqualTo(5L);
         }
     }
 

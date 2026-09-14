@@ -32,6 +32,8 @@ final class Testbed {
     /** Coordinator on ephemeral ports; {@code database} may be {@code :memory:} or a temp file. */
     /** Large enough that admission control never fires unless a test asks it to. */
     static final int UNLIMITED_ACTIVE_JOBS = 1_000_000;
+    /** Long enough that age-based promotion never fires unless a test asks it to. */
+    static final long AGING_STEP_MILLIS = 60_000;
 
     static Coordinator startCoordinator(String database, int maxAttempts) throws IOException {
         return startCoordinator(database, maxAttempts, TASK_TIMEOUT_MILLIS);
@@ -44,16 +46,43 @@ final class Testbed {
 
     static Coordinator startCoordinator(String database, int maxAttempts, long taskTimeoutMillis,
                                         int maxActiveJobs) throws IOException {
-        Coordinator coordinator = new Coordinator(new CoordinatorConfig(
+        return startCoordinator(database, maxAttempts, taskTimeoutMillis, maxActiveJobs,
+                AGING_STEP_MILLIS);
+    }
+
+    static Coordinator startCoordinator(String database, int maxAttempts, long taskTimeoutMillis,
+                                        int maxActiveJobs, long agingStepMillis) throws IOException {
+        Coordinator coordinator = new Coordinator(config(
+                database, maxAttempts, taskTimeoutMillis, maxActiveJobs, agingStepMillis));
+        coordinator.start();
+        return coordinator;
+    }
+
+    /**
+     * Coordinator driven by an injected {@code clock} instead of the system
+     * clock, so a test can advance time deterministically (used for priority
+     * aging). All other timing is identical to the standard test coordinator.
+     */
+    static Coordinator startCoordinator(String database, int maxAttempts, long taskTimeoutMillis,
+                                        int maxActiveJobs, long agingStepMillis,
+                                        java.util.function.LongSupplier clock) throws IOException {
+        Coordinator coordinator = new Coordinator(config(
+                database, maxAttempts, taskTimeoutMillis, maxActiveJobs, agingStepMillis), clock);
+        coordinator.start();
+        return coordinator;
+    }
+
+    private static CoordinatorConfig config(String database, int maxAttempts, long taskTimeoutMillis,
+                                            int maxActiveJobs, long agingStepMillis) {
+        return new CoordinatorConfig(
                 0, 0,
                 HEARTBEAT_TIMEOUT_MILLIS, SWEEP_INTERVAL_MILLIS,
                 taskTimeoutMillis,
                 maxAttempts,
                 50, 200,
                 maxActiveJobs,
-                database));
-        coordinator.start();
-        return coordinator;
+                agingStepMillis,
+                database);
     }
 
     static Worker startWorker(Coordinator coordinator, String workerId, int capacity) {

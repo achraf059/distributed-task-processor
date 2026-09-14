@@ -21,6 +21,7 @@ public record CoordinatorConfig(
         long retryBaseDelayMillis,
         long retryMaxDelayMillis,
         int maxActiveJobs,
+        long agingStepMillis,
         String databasePath) {
 
     public static final int DEFAULT_WORKER_PORT = 7070;
@@ -42,6 +43,14 @@ public record CoordinatorConfig(
      * observe load shedding.
      */
     public static final int DEFAULT_MAX_ACTIVE_JOBS = 10_000;
+    /**
+     * Age-based promotion interval for priority scheduling: for each whole
+     * interval a QUEUED job has waited since submission, its effective scheduling
+     * level rises by one (capped at HIGH). The 60 s default keeps low-priority
+     * work from starving under sustained higher-priority load without letting a
+     * brief backlog reorder normal traffic. See {@code Job#effectiveLevel}.
+     */
+    public static final long DEFAULT_AGING_STEP_MILLIS = 60_000;
     public static final String DEFAULT_DATABASE_PATH = "data/coordinator.db";
 
     /** Path {@code :memory:} selects the non-durable in-memory repository. */
@@ -59,6 +68,7 @@ public record CoordinatorConfig(
                 parsed.getLong("retry-base-delay-millis", DEFAULT_RETRY_BASE_DELAY_MILLIS),
                 parsed.getLong("retry-max-delay-millis", DEFAULT_RETRY_MAX_DELAY_MILLIS),
                 parsed.getInt("max-active-jobs", DEFAULT_MAX_ACTIVE_JOBS),
+                parsed.getLong("aging-step-millis", DEFAULT_AGING_STEP_MILLIS),
                 parsed.get("database", DEFAULT_DATABASE_PATH));
     }
 
@@ -75,6 +85,9 @@ public record CoordinatorConfig(
         }
         if (maxActiveJobs < 1) {
             throw new IllegalArgumentException("max-active-jobs must be >= 1");
+        }
+        if (agingStepMillis <= 0) {
+            throw new IllegalArgumentException("aging-step-millis must be >= 1");
         }
     }
 }

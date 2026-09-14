@@ -3,6 +3,7 @@ package io.github.achrafaittayeb.dtp.coordinator.job;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.achrafaittayeb.dtp.common.model.JobState;
+import io.github.achrafaittayeb.dtp.common.model.TaskPriority;
 import io.github.achrafaittayeb.dtp.common.model.TaskType;
 import io.github.achrafaittayeb.dtp.common.net.MessageIO;
 import org.slf4j.Logger;
@@ -35,12 +36,17 @@ public final class SqliteJobRepository implements JobRepository {
     // idempotency_key is only ever set on INSERT (it is immutable identity for the
     // logical submission); the ON CONFLICT UPDATE path deliberately leaves it alone
     // so re-saving a job on each state change never rewrites its key.
+    // idempotency_key, priority, and submission_sequence are only ever set on
+    // INSERT (they are immutable identity/ordering facts for the logical
+    // submission); the ON CONFLICT UPDATE path deliberately leaves them alone so
+    // re-saving a job on each state change never rewrites them.
     private static final String UPSERT = """
             INSERT INTO jobs (id, task_type, payload, max_attempts, execution_timeout,
                               state, attempts, current_attempt_id, assigned_worker_id,
                               deadline, next_eligible_time, result, error,
-                              created_at, updated_at, idempotency_key)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              created_at, updated_at, idempotency_key,
+                              priority, submission_sequence)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 state = excluded.state,
                 attempts = excluded.attempts,
@@ -88,7 +94,9 @@ public final class SqliteJobRepository implements JobRepository {
                         error TEXT,
                         created_at INTEGER NOT NULL,
                         updated_at INTEGER NOT NULL,
-                        idempotency_key TEXT
+                        idempotency_key TEXT,
+                        priority TEXT NOT NULL DEFAULT 'NORMAL',
+                        submission_sequence INTEGER NOT NULL DEFAULT 0
                     )""");
         }
         // Databases created before execution deadlines existed lack these two
@@ -98,6 +106,16 @@ public final class SqliteJobRepository implements JobRepository {
         // Databases created before idempotent submission lack this column; it is
         // nullable, so existing rows migrate to a NULL (un-keyed) key.
         ensureColumn("idempotency_key", "TEXT");
+        // Databases created before priority scheduling lack these two columns.
+        // Priority defaults to NORMAL, matching the "omitted priority == NORMAL"
+        // rule. submission_sequence defaults to 0 for every legacy row: the
+        // coordinator seeds its next sequence above the persisted maximum, so all
+        // new submissions still receive strictly increasing, unique sequences and
+        // true FIFO ordering. Legacy rows share sequence 0 and are therefore
+        // FIFO-ordered among themselves only best-effort (by created_at, then id,
+        // in the scheduler's comparator) — the honest migration limitation.
+        ensureColumn("priority", "TEXT NOT NULL DEFAULT 'NORMAL'");
+        ensureColumn("submission_sequence", "INTEGER NOT NULL DEFAULT 0");
         // Durable backstop for deduplication: two different jobs can never share a
         // non-null key. The partial predicate lets any number of NULL (un-keyed)
         // jobs coexist. The in-core check is the primary guard; this catches bugs.
@@ -142,6 +160,8 @@ public final class SqliteJobRepository implements JobRepository {
             statement.setLong(14, job.createdAtMillis());
             statement.setLong(15, job.updatedAtMillis());
             statement.setString(16, job.idempotencyKey());
+            statement.setString(17, job.priority().name());
+            statement.setLong(18, job.submissionSequence());
             statement.executeUpdate();
         } catch (SQLException | JsonProcessingException e) {
             // Losing durability silently would break recovery guarantees; fail loudly.
@@ -181,7 +201,9 @@ public final class SqliteJobRepository implements JobRepository {
                 row.getString("error"),
                 row.getLong("created_at"),
                 row.getLong("updated_at"),
-                row.getString("idempotency_key"));
+                row.getString("idempotency_key"),
+                TaskPriority.valueOf(row.getString("priority")),
+                row.getLong("submission_sequence"));
     }
 
     @Override

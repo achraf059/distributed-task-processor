@@ -33,4 +33,32 @@ class CoordinatorConfigTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("max-active-jobs");
     }
+
+    @Test
+    void defaultsAgingStepMillis() {
+        CoordinatorConfig config = CoordinatorConfig.fromArgs(new String[0]);
+        assertThat(config.agingStepMillis()).isEqualTo(CoordinatorConfig.DEFAULT_AGING_STEP_MILLIS);
+        assertThat(config.agingStepMillis()).isEqualTo(60_000L);
+    }
+
+    @Test
+    void parsesAgingStepMillisFlag() {
+        CoordinatorConfig config = CoordinatorConfig.fromArgs(
+                new String[]{"--aging-step-millis", "1000"});
+        assertThat(config.agingStepMillis()).isEqualTo(1000L);
+    }
+
+    @Test
+    void rejectsZeroAgingStepMillis() {
+        assertThatThrownBy(() -> CoordinatorConfig.fromArgs(new String[]{"--aging-step-millis", "0"}))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("aging-step-millis");
+    }
+
+    @Test
+    void rejectsNegativeAgingStepMillis() {
+        assertThatThrownBy(() -> CoordinatorConfig.fromArgs(new String[]{"--aging-step-millis", "-5"}))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("aging-step-millis");
+    }
 }

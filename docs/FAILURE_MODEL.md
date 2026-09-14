@@ -180,6 +180,7 @@ the measured before/after in [MEASURED_BEHAVIOR.md](MEASURED_BEHAVIOR.md)).
 | coordinator `--sweep-interval-millis` | 500 | failure scan + deadline scan + retry promotion + scheduling period |
 | coordinator `--task-timeout-millis` | 600000 | per-attempt execution deadline (coordinator clock) |
 | coordinator `--max-attempts` | 3 | default attempt budget per job |
+| coordinator `--aging-step-millis` | 60000 | queued-job wait per +1 effective priority level (starvation prevention) |
 | coordinator `--retry-base-delay-millis` / `--retry-max-delay-millis` | 1000 / 30000 | exponential backoff bounds |
 
 Lower timeouts detect failures faster but raise false positives; the 3×

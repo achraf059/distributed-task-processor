@@ -118,7 +118,7 @@ public final class WorkerServer implements AutoCloseable {
             throw new ProtocolException("Invalid registration: " + register);
         }
         WorkerSession session = new WorkerSession(register.workerId(), register.capacity(),
-                socket.getOutputStream(), socket, System.currentTimeMillis());
+                socket.getOutputStream(), socket, core.nowMillis());
         core.onWorkerRegistered(session);
         session.send(new WorkerRegistered(register.workerId()));
         return session;

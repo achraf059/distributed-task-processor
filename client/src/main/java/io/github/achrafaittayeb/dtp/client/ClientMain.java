@@ -3,6 +3,7 @@ package io.github.achrafaittayeb.dtp.client;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.achrafaittayeb.dtp.common.model.JobSnapshot;
+import io.github.achrafaittayeb.dtp.common.model.TaskPriority;
 import io.github.achrafaittayeb.dtp.common.model.TaskType;
 import io.github.achrafaittayeb.dtp.common.model.WorkerSnapshot;
 import io.github.achrafaittayeb.dtp.common.util.Args;
@@ -123,9 +124,16 @@ public final class ClientMain {
 
         int submitRetries = options.getInt("submit-retries", 0);
         String idempotencyKey = options.get("idempotency-key", null);
+        TaskPriority priority;
+        try {
+            priority = TaskPriority.fromString(options.get("priority", null));
+        } catch (IllegalArgumentException invalid) {
+            throw new UsageException(invalid.getMessage());
+        }
         String jobId;
         try {
-            jobId = client.submit(taskType, payload, options.getInt("max-attempts", 0), idempotencyKey);
+            jobId = client.submit(taskType, payload, options.getInt("max-attempts", 0),
+                    idempotencyKey, priority);
         } catch (SubmitRejectedException rejected) {
             System.err.println("Submission rejected (coordinator overloaded): " + rejected.getMessage());
             System.err.println("  Active jobs: " + rejected.activeCount()
@@ -141,9 +149,10 @@ public final class ClientMain {
             return;
         }
         System.out.println("Job submitted");
-        System.out.println("  ID:    " + jobId);
-        System.out.println("  Type:  " + taskType);
-        System.out.println("  State: QUEUED");
+        System.out.println("  ID:       " + jobId);
+        System.out.println("  Type:     " + taskType);
+        System.out.println("  Priority: " + priority);
+        System.out.println("  State:    QUEUED");
     }
 
     private static void bench(String host, int port, Args options) throws Exception {
@@ -172,6 +181,7 @@ public final class ClientMain {
     private static void printJob(JobSnapshot job) {
         System.out.println("Job " + job.jobId());
         System.out.println("  Type:     " + job.taskType());
+        System.out.println("  Priority: " + job.priorityOrDefault());
         System.out.println("  State:    " + job.state());
         System.out.println("  Attempt:  " + job.attempts() + "/" + job.maxAttempts());
         if (job.workerId() != null) {
@@ -192,11 +202,11 @@ public final class ClientMain {
             System.out.println("No jobs");
             return;
         }
-        System.out.printf("%-36s  %-11s  %-10s  %-7s  %-10s%n",
-                "JOB ID", "TYPE", "STATE", "ATTEMPT", "WORKER");
+        System.out.printf("%-36s  %-11s  %-8s  %-10s  %-7s  %-10s%n",
+                "JOB ID", "TYPE", "PRIORITY", "STATE", "ATTEMPT", "WORKER");
         for (JobSnapshot job : jobs) {
-            System.out.printf("%-36s  %-11s  %-10s  %-7s  %-10s%n",
-                    job.jobId(), job.taskType(), job.state(),
+            System.out.printf("%-36s  %-11s  %-8s  %-10s  %-7s  %-10s%n",
+                    job.jobId(), job.taskType(), job.priorityOrDefault(), job.state(),
                     job.attempts() + "/" + job.maxAttempts(),
                     job.workerId() == null ? "-" : job.workerId());
         }
@@ -291,6 +301,8 @@ public final class ClientMain {
                         [--prime-limit <n>] [--wait-timeout-millis <ms>]
                 Global options: --host <host> (default localhost), --port <port> (default 7071)
                 Submit options: --max-attempts <n> (default: coordinator setting)
+                  --priority high|normal|low      base scheduling priority (default normal;
+                                                  case-insensitive)
                   --submit-retries <n>            retries after the first attempt on a
                                                   retryable overload rejection (default 0 = off)
                   --submit-retry-base-millis <ms> base back-off (default 200)
