@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.achrafaittayeb.dtp.common.model.JobSnapshot;
 import io.github.achrafaittayeb.dtp.common.model.JobState;
+import io.github.achrafaittayeb.dtp.common.model.TaskPriority;
 import io.github.achrafaittayeb.dtp.common.model.TaskType;
 import io.github.achrafaittayeb.dtp.common.net.MessageIO;
 import io.github.achrafaittayeb.dtp.common.net.ProtocolException;
@@ -45,7 +46,7 @@ class MessageSerializationTest {
     @Test
     void roundTripsClientMessages() throws IOException {
         JobSnapshot snapshot = new JobSnapshot("job-1", TaskType.SHA256, JobState.COMPLETED,
-                1, 3, "worker-2", "abc123", null, 100L, 200L);
+                1, 3, "worker-2", "abc123", null, 100L, 200L, TaskPriority.HIGH);
         assertThat(roundTrip(new JobStatusReply(snapshot)))
                 .isEqualTo(new JobStatusReply(snapshot));
         assertThat(roundTrip(new JobListReply(List.of(snapshot))))
@@ -60,7 +61,7 @@ class MessageSerializationTest {
                 .isEqualTo(new CancelJob("job-1"));
 
         JobSnapshot cancelled = new JobSnapshot("job-1", TaskType.SLEEP, JobState.CANCELLED,
-                1, 3, null, null, "cancelled by client request", 100L, 200L);
+                1, 3, null, null, "cancelled by client request", 100L, 200L, TaskPriority.NORMAL);
         assertThat(roundTrip(new JobCancelReply(true, cancelled)))
                 .isEqualTo(new JobCancelReply(true, cancelled));
     }
@@ -126,5 +127,95 @@ class MessageSerializationTest {
         assertThat(decoded.taskType()).isEqualTo(TaskType.SHA256);
         assertThat(decoded.maxAttempts()).isZero();
         assertThat(decoded.idempotencyKey()).isNull();
+    }
+
+    @Test
+    void roundTripsSubmitJobWithExplicitPriority() throws IOException {
+        ObjectNode payload = JsonNodeFactory.instance.objectNode().put("text", "abc");
+        SubmitJob highPriority = new SubmitJob(TaskType.SHA256, payload, 2, "key-1", TaskPriority.HIGH);
+
+        SubmitJob decoded = (SubmitJob) roundTrip(highPriority);
+        assertThat(decoded).isEqualTo(highPriority);
+        assertThat(decoded.priority()).isEqualTo(TaskPriority.HIGH);
+    }
+
+    @Test
+    void explicitPriorityIsPresentInEncodedJson() throws IOException {
+        ObjectNode payload = JsonNodeFactory.instance.objectNode().put("text", "abc");
+        String json = new String(
+                MessageIO.encode(new SubmitJob(TaskType.SHA256, payload, 0, null, TaskPriority.LOW)),
+                StandardCharsets.UTF_8);
+        assertThat(json).contains("\"priority\":\"LOW\"");
+    }
+
+    @Test
+    void submitJobWithoutPriorityDecodesToNullThenNormalizesToNormal() throws IOException {
+        ObjectNode payload = JsonNodeFactory.instance.objectNode().put("text", "abc");
+
+        // The two back-compatible constructors both omit an explicit priority.
+        SubmitJob noPriority = new SubmitJob(TaskType.SHA256, payload, 0);
+        SubmitJob decoded = (SubmitJob) roundTrip(noPriority);
+        assertThat(decoded.priority()).isNull();
+        assertThat(TaskPriority.normalize(decoded.priority())).isEqualTo(TaskPriority.NORMAL);
+    }
+
+    @Test
+    void decodesLegacySubmitJobWithoutPriorityField() throws IOException {
+        // A frame from a client that predates the priority field must still decode,
+        // with priority absent (null) and normalizing to NORMAL.
+        byte[] legacy = ("{\"type\":\"SUBMIT_JOB\",\"taskType\":\"SHA256\","
+                + "\"payload\":{\"text\":\"abc\"},\"maxAttempts\":0,\"idempotencyKey\":\"k\"}")
+                .getBytes(StandardCharsets.UTF_8);
+        SubmitJob decoded = (SubmitJob) MessageIO.decode(legacy);
+        assertThat(decoded.idempotencyKey()).isEqualTo("k");
+        assertThat(decoded.priority()).isNull();
+        assertThat(TaskPriority.normalize(decoded.priority())).isEqualTo(TaskPriority.NORMAL);
+    }
+
+    @Test
+    void omittedPriorityAndExplicitNormalAreWireEquivalent() throws IOException {
+        ObjectNode payload = JsonNodeFactory.instance.objectNode().put("text", "abc");
+        SubmitJob omitted = (SubmitJob) roundTrip(new SubmitJob(TaskType.SHA256, payload, 0));
+        SubmitJob explicitNormal = (SubmitJob) roundTrip(
+                new SubmitJob(TaskType.SHA256, payload, 0, null, TaskPriority.NORMAL));
+
+        assertThat(TaskPriority.normalize(omitted.priority()))
+                .isEqualTo(TaskPriority.normalize(explicitNormal.priority()))
+                .isEqualTo(TaskPriority.NORMAL);
+    }
+
+    @Test
+    void decodesLegacyJobSnapshotWithoutPriorityField() throws IOException {
+        // A JOB_STATUS reply from a peer that predates the snapshot priority field
+        // must still decode; priority is absent (null) and reads as NORMAL.
+        byte[] legacy = ("{\"type\":\"JOB_STATUS\",\"job\":{"
+                + "\"jobId\":\"job-1\",\"taskType\":\"SHA256\",\"state\":\"COMPLETED\","
+                + "\"attempts\":1,\"maxAttempts\":3,\"workerId\":\"w2\",\"result\":\"abc\","
+                + "\"error\":null,\"createdAtMillis\":100,\"updatedAtMillis\":200}}")
+                .getBytes(StandardCharsets.UTF_8);
+        JobStatusReply decoded = (JobStatusReply) MessageIO.decode(legacy);
+        assertThat(decoded.job().priority()).isNull();
+        assertThat(decoded.job().priorityOrDefault()).isEqualTo(TaskPriority.NORMAL);
+    }
+
+    @Test
+    void jobSnapshotBackCompatConstructorDefaultsPriorityToNormal() {
+        // The 10-arg constructor (no priority) keeps older call sites compiling.
+        JobSnapshot legacy = new JobSnapshot("job-1", TaskType.SHA256, JobState.QUEUED,
+                0, 3, null, null, null, 100L, 200L);
+        assertThat(legacy.priority()).isNull();
+        assertThat(legacy.priorityOrDefault()).isEqualTo(TaskPriority.NORMAL);
+    }
+
+    @Test
+    void unknownFieldsRemainIgnoredAlongsidePriority() throws IOException {
+        // Forward-compat: an unknown trailing field must not break decoding, and a
+        // known priority must still be read.
+        byte[] withUnknown = ("{\"type\":\"SUBMIT_JOB\",\"taskType\":\"SHA256\","
+                + "\"payload\":{\"text\":\"abc\"},\"maxAttempts\":0,"
+                + "\"priority\":\"HIGH\",\"somethingNew\":123}")
+                .getBytes(StandardCharsets.UTF_8);
+        SubmitJob decoded = (SubmitJob) MessageIO.decode(withUnknown);
+        assertThat(decoded.priority()).isEqualTo(TaskPriority.HIGH);
     }
 }

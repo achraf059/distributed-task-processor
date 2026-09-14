@@ -9,6 +9,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.function.LongSupplier;
 
 /**
  * Wires the coordinator together and owns its lifecycle:
@@ -25,8 +26,17 @@ public final class Coordinator implements AutoCloseable {
     private final ClientServer clientServer;
 
     public Coordinator(CoordinatorConfig config) throws IOException {
+        this(config, System::currentTimeMillis);
+    }
+
+    /**
+     * Test seam: identical wiring but with an injectable clock threaded into the
+     * core, so integration tests can make time-dependent behavior (notably
+     * priority aging) deterministic. Production always uses the system clock.
+     */
+    public Coordinator(CoordinatorConfig config, LongSupplier clock) throws IOException {
         JobRepository repository = openRepository(config.databasePath());
-        this.core = new CoordinatorCore(config, repository);
+        this.core = new CoordinatorCore(config, repository, clock);
         this.workerServer = new WorkerServer(config.workerPort(), core);
         this.clientServer = new ClientServer(config.clientPort(), core);
     }

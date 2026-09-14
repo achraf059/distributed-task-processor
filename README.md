@@ -139,6 +139,18 @@ Task types: `sleep --milliseconds N`, `word-count --text "..."`,
 `fail --fail-until-attempt N` (deliberately fails early attempts, for watching
 retries). Run any command without arguments to see usage.
 
+**Priority.** `submit` accepts `--priority high|normal|low` (case-insensitive,
+default `normal`). Higher-priority jobs are assigned ahead of lower-priority
+ones while they wait in the queue; equal priorities keep FIFO order; and a job's
+effective priority rises the longer it waits (every `--aging-step-millis` on the
+coordinator, default 60 s, capped at `high`) so low-priority work never starves.
+Priority is shown by `status` and `list`.
+
+```bash
+./scripts/coordinator.sh --aging-step-millis 30000       # promote a level every 30s
+./scripts/client.sh submit sha256 --text "urgent" --priority high
+```
+
 **Execution deadlines.** Each attempt has a coordinator-enforced execution
 deadline (`--task-timeout-millis`, default 10 minutes). A task that outlives it
 is treated like a lost attempt — the lease is revoked, the worker is asked to
@@ -376,6 +388,20 @@ containers.
   immediately and ask the worker to stop via thread interruption; a task that
   ignores interruption keeps running but can no longer affect job state. This is
   not guaranteed preemption, and it does not make execution exactly-once.
+- **Priority orders the queue; it does not preempt.** A submission carries a
+  base priority — `HIGH`, `NORMAL`, or `LOW` (`--priority`, default `NORMAL`;
+  omitting it is identical to `NORMAL`). Among `QUEUED` jobs the scheduler picks
+  the highest *effective* level first, breaking ties by a persistent monotonic
+  submission sequence so equal-priority jobs run in true FIFO order — even when
+  submitted within the same millisecond. To prevent starvation, a job's
+  effective level rises by one for every whole `--aging-step-millis` (default
+  60 s) it has waited since submission, capped at `HIGH`; an old `LOW` job thus
+  eventually competes as `HIGH` and, having a lower sequence, runs ahead of
+  newer `HIGH` submissions. Priority never touches admission control, worker
+  selection, retries, deadlines, cancellation, or running work — it only orders
+  what is still queued, and there is no preemption. A retry keeps the job's
+  original priority, sequence, and creation time. Priority and sequence are
+  persisted, so ordering is recovered exactly after a coordinator restart.
 - **Overload is shed, not absorbed.** Beyond `--max-active-jobs` the
   coordinator refuses new submissions with a typed, retryable `SUBMIT_REJECTED`
   rather than queueing them. This bounds the coordinator's memory and the
@@ -396,7 +422,9 @@ More detail in [docs/FAILURE_MODEL.md](docs/FAILURE_MODEL.md) and
 - Plaintext TCP with no authentication — production use would need TLS and
   worker authentication.
 - One coordinator (see above); leader election is the natural next step.
-- Scheduling is FIFO / least-loaded; no priorities, deadlines, or fairness.
+- Scheduling is priority-ordered with FIFO tiebreaking and age-based promotion
+  (see below); it is not preemptive — priority only orders jobs that are still
+  QUEUED, never work already running on a worker.
 - Results live in the job row; large results would need external storage.
 - Admission is a single global active-job limit (`--max-active-jobs`); there is
   no per-client fairness or priority in what gets shed. The client surfaces

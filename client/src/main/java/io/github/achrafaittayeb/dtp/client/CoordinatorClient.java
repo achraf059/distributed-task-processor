@@ -2,6 +2,7 @@ package io.github.achrafaittayeb.dtp.client;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.achrafaittayeb.dtp.common.model.JobSnapshot;
+import io.github.achrafaittayeb.dtp.common.model.TaskPriority;
 import io.github.achrafaittayeb.dtp.common.model.TaskType;
 import io.github.achrafaittayeb.dtp.common.model.WorkerSnapshot;
 import io.github.achrafaittayeb.dtp.common.net.MessageIO;
@@ -94,13 +95,27 @@ public final class CoordinatorClient implements AutoCloseable {
      */
     public String submit(TaskType taskType, JsonNode payload, int maxAttempts, String idempotencyKey)
             throws IOException {
-        return submitRetrier.submit(() -> submitOnce(taskType, payload, maxAttempts, idempotencyKey));
+        return submit(taskType, payload, maxAttempts, idempotencyKey, null);
+    }
+
+    /**
+     * Submits with an optional idempotency key and an optional base priority. A
+     * {@code null} priority is sent as-is and the coordinator treats it as
+     * {@link TaskPriority#NORMAL}, so omitting priority is indistinguishable from
+     * an explicit NORMAL. Priority is part of the idempotent-submission identity:
+     * reusing a key with a different priority is a conflict.
+     */
+    public String submit(TaskType taskType, JsonNode payload, int maxAttempts, String idempotencyKey,
+                         TaskPriority priority) throws IOException {
+        return submitRetrier.submit(
+                () -> submitOnce(taskType, payload, maxAttempts, idempotencyKey, priority));
     }
 
     /** One submission exchange over the wire; synchronized like every other request. */
     private synchronized String submitOnce(TaskType taskType, JsonNode payload, int maxAttempts,
-                                           String idempotencyKey) throws IOException {
-        Message reply = exchange(new SubmitJob(taskType, payload, maxAttempts, idempotencyKey));
+                                           String idempotencyKey, TaskPriority priority)
+            throws IOException {
+        Message reply = exchange(new SubmitJob(taskType, payload, maxAttempts, idempotencyKey, priority));
         if (reply instanceof JobSubmitted submitted) {
             return submitted.jobId();
         }

@@ -3,6 +3,7 @@ package io.github.achrafaittayeb.dtp.coordinator.job;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.achrafaittayeb.dtp.common.model.JobSnapshot;
 import io.github.achrafaittayeb.dtp.common.model.JobState;
+import io.github.achrafaittayeb.dtp.common.model.TaskPriority;
 import io.github.achrafaittayeb.dtp.common.model.TaskType;
 
 import java.util.UUID;
@@ -25,6 +26,21 @@ public final class Job {
     private final long createdAtMillis;
     private final String idempotencyKey;
 
+    /**
+     * Base (submitted) priority. Immutable for the job's whole life, so a retry
+     * — which mutates state in place on the same instance — automatically keeps
+     * it. Normalized to non-null at construction. See {@link #effectiveLevel}.
+     */
+    private final TaskPriority priority;
+
+    /**
+     * Coordinator-assigned monotonic submission order, the deterministic FIFO
+     * tiebreak among jobs of equal effective level. Immutable like {@link #priority}
+     * (retries and recovery keep it), assigned once when a genuinely new job is
+     * accepted, and persisted so ordering survives restart.
+     */
+    private final long submissionSequence;
+
     private JobState state;
     private int attempts;
     private String currentAttemptId;
@@ -35,17 +51,30 @@ public final class Job {
     private String error;
     private long updatedAtMillis;
 
-    /** Creates a new QUEUED job with no idempotency key. */
+    /** Creates a new QUEUED job with no idempotency key, NORMAL priority, and sequence 0. */
     public static Job createQueued(TaskType taskType, JsonNode payload, int maxAttempts,
                                    long executionTimeoutMillis, long now) {
         return createQueued(taskType, payload, maxAttempts, executionTimeoutMillis, now, null);
     }
 
+    /** Creates a new QUEUED job with an optional key, NORMAL priority, and sequence 0. */
     public static Job createQueued(TaskType taskType, JsonNode payload, int maxAttempts,
                                    long executionTimeoutMillis, long now, String idempotencyKey) {
+        return createQueued(taskType, payload, maxAttempts, executionTimeoutMillis, now,
+                idempotencyKey, TaskPriority.NORMAL, 0);
+    }
+
+    /**
+     * Creates a new QUEUED job. The coordinator supplies the {@code priority}
+     * (normalized to non-null) and the {@code submissionSequence} it assigned on
+     * its single-writer path.
+     */
+    public static Job createQueued(TaskType taskType, JsonNode payload, int maxAttempts,
+                                   long executionTimeoutMillis, long now, String idempotencyKey,
+                                   TaskPriority priority, long submissionSequence) {
         return new Job(UUID.randomUUID().toString(), taskType, payload, maxAttempts,
                 executionTimeoutMillis, JobState.QUEUED, 0, null, null, 0, 0, null, null, now, now,
-                idempotencyKey);
+                idempotencyKey, priority, submissionSequence);
     }
 
     /** Full-field constructor used when rehydrating from persistent storage. */
@@ -53,7 +82,8 @@ public final class Job {
                long executionTimeoutMillis, JobState state, int attempts,
                String currentAttemptId, String assignedWorkerId,
                long deadlineMillis, long nextEligibleTimeMillis, String result, String error,
-               long createdAtMillis, long updatedAtMillis, String idempotencyKey) {
+               long createdAtMillis, long updatedAtMillis, String idempotencyKey,
+               TaskPriority priority, long submissionSequence) {
         this.id = id;
         this.taskType = taskType;
         this.payload = payload;
@@ -70,6 +100,8 @@ public final class Job {
         this.createdAtMillis = createdAtMillis;
         this.updatedAtMillis = updatedAtMillis;
         this.idempotencyKey = idempotencyKey;
+        this.priority = TaskPriority.normalize(priority);
+        this.submissionSequence = submissionSequence;
     }
 
     /**
@@ -162,6 +194,27 @@ public final class Job {
                 || (state == JobState.RETRY_WAIT && nextEligibleTimeMillis <= now);
     }
 
+    /**
+     * The job's aged scheduling level at instant {@code now}:
+     * {@code min(MAX_LEVEL, baseLevel + floor(waitingAge / agingStepMillis))}.
+     *
+     * <p>Aging is measured from {@link #createdAtMillis} (original submission),
+     * so a retried job keeps accumulating fairness rather than resetting. The
+     * waiting age is floored at zero, so a backwards clock reading can never push
+     * a job <em>below</em> its base level. Pure function of its inputs: given the
+     * same {@code now} it always returns the same value, which is what keeps the
+     * scheduler deterministic and testable with a controlled clock.
+     *
+     * @param now             the single time captured for this scheduling pass
+     * @param agingStepMillis the promotion interval; must be positive
+     */
+    public int effectiveLevel(long now, long agingStepMillis) {
+        long waitingAge = Math.max(0L, now - createdAtMillis);
+        long promotions = waitingAge / agingStepMillis;
+        long level = priority.baseLevel() + promotions;
+        return (int) Math.min(TaskPriority.MAX_LEVEL, level);
+    }
+
     private void transition(JobState target, long now) {
         if (!state.canTransitionTo(target)) {
             throw new IllegalStateException(
@@ -179,7 +232,7 @@ public final class Job {
 
     public JobSnapshot snapshot() {
         return new JobSnapshot(id, taskType, state, attempts, maxAttempts,
-                assignedWorkerId, result, error, createdAtMillis, updatedAtMillis);
+                assignedWorkerId, result, error, createdAtMillis, updatedAtMillis, priority);
     }
 
     public String id() {
@@ -189,6 +242,16 @@ public final class Job {
     /** Client-supplied submission-deduplication key, or {@code null} if none was provided. */
     public String idempotencyKey() {
         return idempotencyKey;
+    }
+
+    /** Base (submitted) priority; never null. */
+    public TaskPriority priority() {
+        return priority;
+    }
+
+    /** Coordinator-assigned monotonic submission order, the deterministic FIFO tiebreak. */
+    public long submissionSequence() {
+        return submissionSequence;
     }
 
     public TaskType taskType() {

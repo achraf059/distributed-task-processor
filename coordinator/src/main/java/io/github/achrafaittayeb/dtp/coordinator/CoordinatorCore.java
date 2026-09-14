@@ -3,6 +3,7 @@ package io.github.achrafaittayeb.dtp.coordinator;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.achrafaittayeb.dtp.common.model.JobSnapshot;
 import io.github.achrafaittayeb.dtp.common.model.JobState;
+import io.github.achrafaittayeb.dtp.common.model.TaskPriority;
 import io.github.achrafaittayeb.dtp.common.model.TaskType;
 import io.github.achrafaittayeb.dtp.common.model.WorkerSnapshot;
 import io.github.achrafaittayeb.dtp.common.protocol.TaskAssign;
@@ -29,6 +30,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
 /**
@@ -86,9 +88,40 @@ public final class CoordinatorCore implements AutoCloseable {
      */
     private int activeJobCount;
 
+    /**
+     * Source of the monotonic {@code submissionSequence} stamped on each
+     * genuinely new job — the deterministic FIFO tiebreak among jobs of equal
+     * effective priority. Confined to the core thread, so read-then-increment is
+     * race-free without locking, exactly like {@link #activeJobCount}.
+     *
+     * <p>Only a fresh accepted submission consumes a value; idempotent
+     * duplicates and admission rejections never do. On recovery it is seeded to
+     * one past the largest persisted sequence (see {@link #recoverFromRepository}),
+     * so every post-restart submission still sorts strictly after every job that
+     * already existed. Starts at 1, leaving 0 as the reserved value migrated
+     * legacy rows carry.
+     */
+    private long nextSubmissionSequence = 1;
+
+    /**
+     * The one wall-clock source for all coordinator timing — assignment
+     * deadlines, retry backoff, heartbeat-liveness, and priority aging. Every
+     * time-dependent decision reads it through {@link #now()} so nothing calls
+     * {@link System#currentTimeMillis()} directly. Production uses the system
+     * clock; tests inject a controllable one to make aging deterministic without
+     * sleeping. Injecting it does not change any observable behavior.
+     */
+    private final LongSupplier clock;
+
     public CoordinatorCore(CoordinatorConfig config, JobRepository repository) {
+        this(config, repository, System::currentTimeMillis);
+    }
+
+    /** Test seam: same as the public constructor but with an injectable clock. */
+    CoordinatorCore(CoordinatorConfig config, JobRepository repository, LongSupplier clock) {
         this.config = config;
         this.repository = repository;
+        this.clock = clock;
         this.retryPolicy = new RetryPolicy(config.retryBaseDelayMillis(), config.retryMaxDelayMillis());
         this.coreThread = Executors.newSingleThreadScheduledExecutor(
                 runnable -> new Thread(runnable, "coordinator-core"));
@@ -172,10 +205,16 @@ public final class CoordinatorCore implements AutoCloseable {
         }
     }
 
-    /** Overload {@link #submitJob(TaskType, JsonNode, int, String)} without an idempotency key. */
+    /** Overload without an idempotency key or explicit priority (defaults NORMAL). */
     public SubmitOutcome submitJob(TaskType taskType, JsonNode payload, int requestedMaxAttempts)
             throws InvalidPayloadException {
-        return submitJob(taskType, payload, requestedMaxAttempts, null);
+        return submitJob(taskType, payload, requestedMaxAttempts, null, null);
+    }
+
+    /** Overload with an optional idempotency key but no explicit priority (defaults NORMAL). */
+    public SubmitOutcome submitJob(TaskType taskType, JsonNode payload, int requestedMaxAttempts,
+                                   String idempotencyKey) throws InvalidPayloadException {
+        return submitJob(taskType, payload, requestedMaxAttempts, idempotencyKey, null);
     }
 
     /**
@@ -199,25 +238,34 @@ public final class CoordinatorCore implements AutoCloseable {
      *
      * <p>Deduplication prevents a <em>duplicate logical submission</em>; it does
      * not change execution semantics, which remain at-least-once. Only fresh
-     * submissions pass through admission; execution retries never do.
+     * submissions pass through admission; execution retries never do. A fresh
+     * accepted job is the only thing that consumes a submission sequence.
+     *
+     * <p>{@code priority} is normalized so a {@code null} (omitted) priority is
+     * indistinguishable from an explicit {@link TaskPriority#NORMAL}, and it is
+     * part of the logical-submission identity for idempotency (see
+     * {@link #matchesSubmission}).
      */
     public SubmitOutcome submitJob(TaskType taskType, JsonNode payload, int requestedMaxAttempts,
-                                   String idempotencyKey) throws InvalidPayloadException {
+                                   String idempotencyKey, TaskPriority priority)
+            throws InvalidPayloadException {
         TaskPayloads.validate(taskType, payload);
         int maxAttempts = requestedMaxAttempts > 0 ? requestedMaxAttempts : config.defaultMaxAttempts();
+        TaskPriority effectivePriority = TaskPriority.normalize(priority);
         return askCore(() -> {
             if (idempotencyKey != null) {
                 String existingId = jobIdByKey.get(idempotencyKey);
                 if (existingId != null) {
                     Job existing = jobs.get(existingId);
-                    if (!matchesSubmission(existing, taskType, payload, maxAttempts)) {
+                    if (!matchesSubmission(existing, taskType, payload, maxAttempts, effectivePriority)) {
                         log.warn("Idempotency conflict: key={} bound to jobId={} but resubmission "
-                                + "differs (type/payload/maxAttempts)", idempotencyKey, existingId);
+                                + "differs (type/payload/maxAttempts/priority)", idempotencyKey, existingId);
                         return SubmitOutcome.conflict("Idempotency key '" + idempotencyKey
                                 + "' is already bound to a different submission (job " + existingId + ")");
                     }
                     log.info("Idempotent duplicate: key={} returning original jobId={} (state {})",
                             idempotencyKey, existingId, existing.state());
+                    // A duplicate creates no job, so it consumes no submission sequence.
                     return SubmitOutcome.accepted(existingId, activeJobCount, config.maxActiveJobs());
                 }
             }
@@ -225,18 +273,22 @@ public final class CoordinatorCore implements AutoCloseable {
             if (activeJobCount >= limit) {
                 log.warn("Job submission rejected (overloaded): activeJobs={} limit={} type={}",
                         activeJobCount, limit, taskType);
+                // A rejection creates no persisted job, so it consumes no sequence.
                 return SubmitOutcome.rejected(activeJobCount, limit);
             }
+            long sequence = nextSubmissionSequence++;
             Job job = Job.createQueued(taskType, payload, maxAttempts,
-                    config.taskTimeoutMillis(), now(), idempotencyKey);
+                    config.taskTimeoutMillis(), now(), idempotencyKey, effectivePriority, sequence);
             jobs.put(job.id(), job);
             if (idempotencyKey != null) {
                 jobIdByKey.put(idempotencyKey, job.id());
             }
             activeJobCount++;
             repository.save(job);
-            log.info("Job submitted: jobId={} type={} maxAttempts={} activeJobs={}/{} idempotencyKey={}",
-                    job.id(), taskType, maxAttempts, activeJobCount, limit, idempotencyKey);
+            log.info("Job submitted: jobId={} type={} priority={} seq={} maxAttempts={} "
+                            + "activeJobs={}/{} idempotencyKey={}",
+                    job.id(), taskType, effectivePriority, sequence, maxAttempts,
+                    activeJobCount, limit, idempotencyKey);
             scheduleQueuedJobs();
             return SubmitOutcome.accepted(job.id(), activeJobCount, limit);
         });
@@ -245,15 +297,17 @@ public final class CoordinatorCore implements AutoCloseable {
     /**
      * Whether a resubmission under a known key describes the same logical work as
      * the job the key already created. Payload equality is structural
-     * ({@link JsonNode#equals}), and the stored job holds the already-resolved
-     * effective max attempts, so it is compared against the incoming effective
-     * value.
+     * ({@link JsonNode#equals}); the stored job holds the already-resolved
+     * effective max attempts and normalized priority, so both are compared
+     * against the incoming effective values. Priority is part of the identity, so
+     * reusing a key with a different priority is a conflict, not a duplicate.
      */
     private boolean matchesSubmission(Job existing, TaskType taskType, JsonNode payload,
-                                      int effectiveMaxAttempts) {
+                                      int effectiveMaxAttempts, TaskPriority effectivePriority) {
         return existing != null
                 && existing.taskType() == taskType
                 && existing.maxAttempts() == effectiveMaxAttempts
+                && existing.priority() == effectivePriority
                 && existing.payload().equals(payload);
     }
 
@@ -437,11 +491,19 @@ public final class CoordinatorCore implements AutoCloseable {
         }
     }
 
-    /** Assigns QUEUED jobs (oldest first) to workers with free capacity (least loaded first). */
+    /**
+     * Assigns QUEUED jobs to workers with free capacity (least loaded first),
+     * in the priority order defined by {@link #queuedOrder(long)}: higher
+     * effective (aged) priority first, ties broken by submission sequence (FIFO).
+     * The scheduling clock is read exactly once here and threaded into the
+     * comparator, so every pairwise comparison in a single pass sees one
+     * consistent {@code now} and the ordering is deterministic.
+     */
     private void scheduleQueuedJobs() {
+        long now = now();
         List<Job> queued = jobs.values().stream()
                 .filter(job -> job.state() == JobState.QUEUED)
-                .sorted(Comparator.comparingLong(Job::createdAtMillis))
+                .sorted(queuedOrder(now))
                 .toList();
         for (Job job : queued) {
             if (job.state() != JobState.QUEUED) {
@@ -453,6 +515,32 @@ public final class CoordinatorCore implements AutoCloseable {
             }
             assign(job, available.getFirst());
         }
+    }
+
+    /**
+     * The scheduling order for QUEUED jobs, evaluated against a single captured
+     * {@code now}:
+     *
+     * <ol>
+     *   <li>higher effective level first (base priority promoted by age, capped
+     *       at HIGH — see {@link Job#effectiveLevel});</li>
+     *   <li>then lower submission sequence first, the deterministic FIFO tiebreak
+     *       among equal effective levels;</li>
+     *   <li>then created-at, then job id — a stable, total fallback that only
+     *       matters for migrated legacy rows, which all share sequence 0 (their
+     *       FIFO order is therefore best-effort by creation time).</li>
+     * </ol>
+     *
+     * <p>Isolated as its own method so the ordering policy is explicit and unit
+     * testable without a running coordinator.
+     */
+    Comparator<Job> queuedOrder(long now) {
+        long step = config.agingStepMillis();
+        return Comparator
+                .comparingInt((Job job) -> job.effectiveLevel(now, step)).reversed()
+                .thenComparingLong(Job::submissionSequence)
+                .thenComparingLong(Job::createdAtMillis)
+                .thenComparing(Job::id);
     }
 
     private void assign(Job job, WorkerSession worker) {
@@ -515,7 +603,9 @@ public final class CoordinatorCore implements AutoCloseable {
         }
         log.info("Recovery started: {} persisted jobs", stored.size());
         int requeued = 0;
+        long maxSequence = 0;
         for (Job job : stored) {
+            maxSequence = Math.max(maxSequence, job.submissionSequence());
             if (job.state() == JobState.RUNNING) {
                 if (job.hasAttemptsLeft()) {
                     job.requeueForRecovery(now());
@@ -545,8 +635,12 @@ public final class CoordinatorCore implements AutoCloseable {
                 activeJobCount++;
             }
         }
-        log.info("Recovery completed: {} jobs loaded, {} requeued, {} active",
-                stored.size(), requeued, activeJobCount);
+        // Resume the sequence strictly above every persisted value so post-restart
+        // submissions always sort after pre-restart jobs. Legacy rows carry 0, so
+        // this still yields 1 for the first new submission on a migrated database.
+        nextSubmissionSequence = maxSequence + 1;
+        log.info("Recovery completed: {} jobs loaded, {} requeued, {} active, next sequence {}",
+                stored.size(), requeued, activeJobCount, nextSubmissionSequence);
     }
 
     // ------------------------------------------------------------------
@@ -554,7 +648,17 @@ public final class CoordinatorCore implements AutoCloseable {
     // ------------------------------------------------------------------
 
     private long now() {
-        return System.currentTimeMillis();
+        return clock.getAsLong();
+    }
+
+    /**
+     * The coordinator's current clock reading (epoch millis; the system clock in
+     * production). Exposed so connection servers stamp worker sessions with the
+     * same clock the core uses for liveness, keeping every timestamp consistent
+     * when a test injects a controlled clock.
+     */
+    public long nowMillis() {
+        return now();
     }
 
     /**

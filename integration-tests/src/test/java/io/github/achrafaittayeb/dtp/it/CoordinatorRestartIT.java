@@ -174,7 +174,7 @@ class CoordinatorRestartIT {
                             workerPort, clientPort,
                             Testbed.HEARTBEAT_TIMEOUT_MILLIS, Testbed.SWEEP_INTERVAL_MILLIS,
                             Testbed.TASK_TIMEOUT_MILLIS, 3, 50, 200,
-                            Testbed.UNLIMITED_ACTIVE_JOBS, database))) {
+                            Testbed.UNLIMITED_ACTIVE_JOBS, Testbed.AGING_STEP_MILLIS, database))) {
                 second.start();
                 try (CoordinatorClient client = new CoordinatorClient("localhost", clientPort)) {
                     Testbed.waitUntil("worker re-registered after restart", Testbed.TERMINAL_TIMEOUT,

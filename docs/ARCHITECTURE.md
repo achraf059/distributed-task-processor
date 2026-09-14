@@ -47,9 +47,18 @@ DESIGN_DECISIONS.
 - **WorkerRegistry** — live sessions by worker id, heartbeat timestamps,
   capacity accounting (`capacity - activeJobs`). Plain `HashMap`s, safe by
   thread confinement.
-- **Scheduler** (`scheduleQueuedJobs`) — oldest `QUEUED` job first, assigned
-  to the least-loaded worker with free capacity. Runs after every event that
-  could create work or capacity, plus each sweep.
+- **Scheduler** (`scheduleQueuedJobs` / `queuedOrder`) — orders `QUEUED` jobs
+  by highest *effective* priority first, then by a persistent monotonic
+  submission sequence (deterministic FIFO within a level), and assigns each to
+  the least-loaded worker with free capacity. Effective level is base priority
+  (`HIGH`=2, `NORMAL`=1, `LOW`=0) promoted by `floor(age / aging-step-millis)`
+  and capped at `HIGH`, where `age` is measured from submission time; this
+  age-based promotion is what prevents starvation of low-priority work. The
+  scheduling clock is read exactly once per pass and threaded into the
+  comparator, so a pass is deterministic and the ordering policy is unit-tested
+  in isolation. Runs after every event that could create work or capacity, plus
+  each sweep. Priority affects *only* this ordering — never admission, worker
+  selection, or running work, and there is no preemption.
 - **Failure detector** (`detectDeadWorkers`) — a session whose last heartbeat
   is older than `heartbeat-timeout-millis` (default 6000) is suspected dead:
   session removed and closed, each of its RUNNING jobs retried or failed.
@@ -87,7 +96,14 @@ On startup (`recoverFromRepository`), before any network listener opens:
 - `RUNNING` jobs (their worker sessions are gone, attempt outcome unknown)
   are requeued if budget remains, else failed with an explicit
   "restarted during final attempt" error;
-- `RETRY_WAIT`/`QUEUED`/terminal jobs load as-is.
+- `RETRY_WAIT`/`QUEUED`/terminal jobs load as-is;
+- each job's base priority and submission sequence load with it, and the
+  submission-sequence counter resumes at one past the largest persisted value,
+  so post-restart submissions always sort after recovered jobs and scheduling
+  order is reproduced exactly. Databases created before this milestone migrate
+  their rows to `NORMAL` priority and sequence `0`; those legacy rows share
+  sequence `0` and so fall back to creation-time ordering among themselves,
+  while every new submission still gets a unique increasing sequence.
 
 `Coordinator.close()` shuts the core down *first*, freezing durable state,
 then closes sockets. A graceful stop therefore leaves exactly the same

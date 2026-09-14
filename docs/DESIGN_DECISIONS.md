@@ -300,3 +300,60 @@ resend return the *same* logical job instead of a new one.
   namespace — two clients choosing the same string collide. Proper per-client
   isolation needs identity the system deliberately does not yet have; until then,
   callers should use unguessable, namespaced keys (e.g. UUIDs).
+
+## 17. Persistent priority scheduling with age-based starvation prevention
+
+The scheduler was strict FIFO / least-loaded. This decision adds a base priority
+to submissions and orders the queue by it, while keeping FIFO fairness within a
+level and guaranteeing that low-priority work cannot starve.
+
+- **Three named levels, never numbers on the wire.** Priority is `HIGH`,
+  `NORMAL`, or `LOW` (`TaskPriority`), carried by name in `SUBMIT_JOB` and the
+  job snapshot. Keeping raw numbers out of the protocol means the internal
+  scheduling math can change without a wire break. The field is nullable and
+  trailing with delegating constructors — the same back-compat pattern as the
+  idempotency key (decision 16): an omitted priority decodes to `null` and is
+  normalized to `NORMAL`, so old clients and old persisted rows are unchanged and
+  "omitted" is indistinguishable from an explicit `NORMAL` everywhere, including
+  idempotency identity.
+- **Effective priority = base level promoted by age, capped at HIGH.**
+  `effectiveLevel = min(2, baseLevel + floor(waitingAge / aging-step-millis))`
+  with `HIGH`=2, `NORMAL`=1, `LOW`=0 and `waitingAge = max(0, now - createdAt)`.
+  Age is measured from original submission, so a job that has waited long enough
+  is promoted regardless of base level; the floor at zero means a backwards
+  clock reading can never demote a job below its base. The default step is 60 s.
+  This is the whole starvation-prevention mechanism: a `LOW` job that waits two
+  steps competes as `HIGH`.
+- **Deterministic FIFO via a persistent submission sequence.** Ordering is
+  effective-level-desc, then a coordinator-assigned monotonic `submissionSequence`
+  ascending. `createdAtMillis` alone is not enough — two jobs can share a
+  millisecond and `HashMap` iteration order is undefined — so a dedicated
+  sequence is the tiebreak. It is assigned on the single-writer path only when a
+  genuinely new job is accepted (idempotent duplicates and rejected submissions
+  consume none), persisted on the job row, and on recovery the counter resumes at
+  one past the largest persisted value, so post-restart submissions always sort
+  after recovered ones. This is not a distributed sequence generator — the
+  coordinator is already the sole writer, so a plain counter suffices.
+- **The clock is read once per pass.** `scheduleQueuedJobs` captures `now` a
+  single time and threads it into the comparator (`queuedOrder(now)`), so every
+  comparison in a pass sees a consistent time and the ordering is a pure,
+  unit-testable function — no per-comparison clock calls, no flaky ordering.
+- **Priority orders only what is queued.** It deliberately does not touch
+  admission control, worker selection, retry budgets, deadlines, cancellation,
+  or stale-result handling, and it adds no preemption: a running job is never
+  interrupted because something higher-priority arrived. A retry keeps the job's
+  original priority, sequence, and creation time — bounded attempts, not
+  de-prioritization, are what stop an endlessly failing job.
+- **Persistence rides the existing job row.** Two columns (`priority`,
+  `submission_sequence`) are added with the same in-place `ensureColumn`
+  migration used for the deadline and idempotency columns, and are written only
+  on insert (immutable identity/ordering facts). Only base facts are stored;
+  effective priority is always recomputed and never persisted, since it changes
+  with time. Legacy rows migrate to `NORMAL`/sequence `0`: an honest limitation
+  is that pre-existing rows share sequence `0` and so order among themselves only
+  by creation time (best-effort FIFO), while every new submission gets true FIFO.
+- **What it is not.** This is not weighted fair queuing, not per-client fairness
+  (there is still no client identity — see decision 16), and not production-grade
+  QoS. It is a single deterministic comparator with an aging term: enough to
+  order work by importance and guarantee no queue member waits forever, and no
+  more.
